@@ -1,0 +1,4 @@
+./wandb/*
+./gen_results/*
+./gen_results_with_system_prompt/*
+./__pycache__/*
