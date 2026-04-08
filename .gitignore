@@ -1,5 +1,6 @@
 wandb/*
 gen_results/*
+optimization_histories/*
 gen_results_with_system_prompt/*
 __pycache__/*
 *.jsonl

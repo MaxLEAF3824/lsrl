@@ -113,17 +113,16 @@ def parse_args():
     parser.add_argument("--mask_max_k", type=int, default=32768)
     parser.add_argument("--grad_direction", type=str, default="positive", choices=["positive", "negative"])
     parser.add_argument("--optimizer", type=str, default="adam", choices=["adam", "frank_wolfe"])
+    parser.add_argument("--fw_gamma", type=float, default=0.1, help="Frank-Wolfe 优化器的初始 Gamma 步长")
     parser.add_argument("--conn_type", type=str, default="fast", choices=["fast", "original"])
-    parser.add_argument("--reg_type", type=str, default="kl", choices=["kl", "lm_prior"])
+    parser.add_argument("--reg_type", type=str, default="kl", choices=["kl", "lm"])
     parser.add_argument("--early_stop", action="store_true")
     parser.add_argument("--early_stop_threshold", type=float, default=1e-3)
     return parser.parse_args()
 
 def main():
     args = parse_args()
-    
     print(f"🚀 Starting Latent Optimization with Config: {vars(args)}")
-    
     wandb.init(project="L-GRPO-Math500", config=vars(args))
     wandb.define_metric("global_step")
     wandb.define_metric("train/*", step_metric="global_step")
@@ -139,7 +138,6 @@ def main():
         dtype=torch.bfloat16, attn_implementation="flash_attention_2"
     ).to(device)
     model.requires_grad_(False)
-    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False}) 
     
     vllm_engine = VLLMDPWorkerPool(model_name=args.model_name, gpu_ids=args.vllm_gpus)
     
@@ -155,7 +153,8 @@ def main():
     wrong_dataset = build_math_wrong_dataset(args.file_path, tokenizer)
     
     # 临时测试：截取前 部分 个样本跑 Demo
-    raw_data = wrong_dataset.flat_data[74:82]
+    raw_data = wrong_dataset.flat_data
+    # raw_data = raw_data[74:82]
     # ==================================================
     # Phase 1: 构建 CPU 静态缓存 & GPU 活跃潜变量注册表
     # ==================================================
@@ -179,7 +178,7 @@ def main():
         embeds_pred, ids_pred = get_embeds(d['pred_text'])
         embeds_think, ids_think = get_embeds(d['thinking_text'])
         
-        curr_think = torch.nn.Parameter(embeds_think.detach().clone())
+        curr_think = torch.nn.Parameter(embeds_think.detach().cpu().clone())
         global_latents[uid] = curr_think
         
         with torch.no_grad():
@@ -199,60 +198,60 @@ def main():
                 
             topk_probs, topk_indices = torch.topk(orig_probs, k=100, dim=-1)
             
+            # 【修改2】剔除 embeds_*，仅保留轻量级的 IDs 和其他标量
             static_data_cpu[uid] = {
-                "ids_q": ids_q.cpu(), "embeds_q": embeds_q.cpu(),
-                "ids_conn": ids_conn.cpu(), "embeds_conn": embeds_conn.cpu(),
-                "ids_gt": ids_gt.cpu(), "embeds_gt": embeds_gt.cpu(),
-                "ids_pred": ids_pred.cpu(), "embeds_pred": embeds_pred.cpu(),
+                "ids_q": ids_q.cpu(), 
+                "ids_conn": ids_conn.cpu(), 
+                "ids_gt": ids_gt.cpu(), 
+                "ids_pred": ids_pred.cpu(), 
                 "ids_think": ids_think.cpu(),
                 "grad_mask": mask.unsqueeze(-1).cpu(),
-                "topk_probs": topk_probs.cpu(), "topk_indices": topk_indices.cpu(),
+                "topk_probs": topk_probs.cpu(), 
+                "topk_indices": topk_indices.cpu(),
                 "thinking_text": d['thinking_text']
             }
             del orig_full, orig_out, orig_probs
             
     torch.cuda.empty_cache()
     
+    # 👇 新增：用于追踪每个 UID 历史上最高的 Pure Acc 及其对应的 Latent
+    optimal_latents = {uid: {"acc": -1.0, "latent": None} for uid in global_latents.keys()}
+    
     if args.optimizer == "adam":
         optimizer = torch.optim.Adam(global_latents.values(), lr=args.learning_rate)
     elif args.optimizer == "frank_wolfe":
         optimizer = FrankWolfeOptimizer(all_embeddings)
 
-    # 从 wandb 获取当前 run 的名字 (即使 wandb 自动追加了随机后缀也能准确获取)
     run_name = wandb.run.name if wandb.run is not None else f"opt_v2_{args.optimizer}_{args.reg_type}"
-    history_filename = f"optimization_history_{run_name}.jsonl"
+    history_filename = f"./optimization_histories/optimization_history_{run_name}.jsonl"
     print(f"📁 History 将保存至: {history_filename}")
-    
-    # 打开文件
     history_file = open(history_filename, "a", encoding="utf-8")
     
-    # 👇 新增：在文件第 0 行写入当前的 config 字典
+    # 在文件第 0 行写入当前的 config 字典
     history_file.write(json.dumps({"config": vars(args)}, ensure_ascii=False) + "\n")
     history_file.flush()
-    # 👆 新增结束
 
     # ==================================================
     # Phase 2: 外层循环 (Global Steps / Epochs)
     # ==================================================
     for step in range(args.steps):
         if not active_uids:
-            print("🎉 所有样本均已触发 Early Stop，训练提前结束！")
+            print("🎉 所有样本均已触发 Early Stop，优化阶段结束，进入 Final Eval！")
             break
             
         print(f"\n==============================================")
         print(f"🔄 Global Step {step+1}/{args.steps} | Active Samples: {len(active_uids)}")
-        print(f"\n==============================================")
+        print(f"==============================================")
         
         progress = step / max(1, args.steps - 1)
         cosine_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
         current_lr = (args.learning_rate * 0.1) + (args.learning_rate * 0.9) * cosine_factor
-        
+        current_fw_gamma = (args.fw_gamma * 0.1) + (args.fw_gamma * 0.9) * cosine_factor
         if args.optimizer == "adam":
             for pg in optimizer.param_groups: pg['lr'] = current_lr
         
         step_metrics = {uid: {} for uid in active_uids}
         
-        # 记录 Epoch 全局累计 Loss
         epoch_gt_loss_sum = 0.0
         epoch_kl_loss_sum = 0.0
         epoch_lm_loss_sum = 0.0
@@ -372,15 +371,10 @@ def main():
                 all_kl_div_list.append(kl_sum / think_len)
                 batch_logprobs.append(logprobs_sum / think_len)
                 
-                all_kl_div_list.append(kl_sum / think_len)
-                batch_logprobs.append(logprobs_sum / think_len)
-                
-                # 👇 新增与修改：计算单样本的 total_loss 并写入 step_metrics
                 s_gt = gt_loss.item()
                 s_kl = (kl_sum / think_len).item()
                 s_lm = -(logprobs_sum / think_len).item()
                 
-                # 根据你的 config 计算加权 total_loss
                 s_reg = s_kl if args.reg_type == "kl" else s_lm
                 s_total = s_gt + args.kl_weight * s_reg
                 
@@ -399,14 +393,13 @@ def main():
             reg_loss = batch_kl_loss if args.reg_type == "kl" else batch_lm_prior_loss
             total_loss = batch_gt_loss + args.kl_weight * reg_loss
             
-            # 更新 Epoch 总 Loss (累加计算均值)
+            # 更新 Epoch 总 Loss
             batch_sample_count = len(batch_uids)
             epoch_gt_loss_sum += batch_gt_loss.item() * batch_sample_count
             epoch_kl_loss_sum += batch_kl_loss.item() * batch_sample_count
             epoch_lm_loss_sum += batch_lm_prior_loss.item() * batch_sample_count
             epoch_total_loss_sum += total_loss.item() * batch_sample_count
             
-            # 丰富进度条内容
             pbar.set_postfix({
                 "Total": f"{total_loss.item():.3f}", 
                 "GT": f"{batch_gt_loss.item():.3f}",
@@ -421,15 +414,14 @@ def main():
             if args.optimizer == "adam": optimizer.step()
             elif args.optimizer == "frank_wolfe":
                 for latent, mask in zip(curr_think_list, curr_mask_list):
-                    optimizer.step(latent, gamma=0.01 + 0.09 * cosine_factor)
+                    optimizer.step(latent, gamma=current_fw_gamma)
 
             del full_embeds_batch, full_attention_mask, last_hidden
             torch.cuda.empty_cache()
 
         # --------------------------------------------------
-        # 2.2 全局评测 (ROUGE-L, Acc, Wandb Logging)
+        # 2.2 中间层评测 (Eval) & Logging
         # --------------------------------------------------
-        # 1. 记录 Epoch 级别各种平均 Loss 到 WandB
         wandb.log({
             "global_step": step,
             "train/epoch_total_loss": epoch_total_loss_sum / len(active_uids),
@@ -440,11 +432,13 @@ def main():
             "active_samples": len(active_uids)
         })
 
-        if step % args.eval_every == 0 or step == args.steps - 1:
+        if step % args.eval_every == 0 and step != args.steps - 1:
             total_pure_acc, total_forced_acc, total_fast_acc = 0.0, 0.0, 0.0
             total_rouge_l, total_change_ratio = 0.0, 0.0
             
-            print(f"🚀 [Global Eval] 1/2 计算潜空间 Token 漂移度 (ROUGE-L & Change Ratio)...")
+            print(f"🚀 [Intermediate Eval] 计算潜空间漂移 & 发送 {len(active_uids)} 个潜变量至 vLLM ...")
+            eval_pure_inputs, eval_forced_inputs, eval_fast_inputs = [], [], []
+            
             for uid in active_uids:
                 ct = global_latents[uid].to(all_embeddings.dtype).detach()
                 sd = static_data_cpu[uid]
@@ -467,11 +461,6 @@ def main():
                 total_change_ratio += change_ratio
                 total_rouge_l += rouge_l_f1
 
-            print(f"🚀 [Global Eval] 2/2 发送 {len(active_uids)} 个潜变量至 vLLM Worker Pool...")
-            eval_pure_inputs, eval_forced_inputs, eval_fast_inputs = [], [], []
-            for uid in active_uids:
-                ct = global_latents[uid].to(all_embeddings.dtype).detach()
-                sd = static_data_cpu[uid]
                 embeds_q = sd["embeds_q"].to(device)
                 embeds_conn = sd["embeds_conn"].to(device)
                 
@@ -481,11 +470,12 @@ def main():
 
             modes = [('pure', eval_pure_inputs, 2048), ('forced', eval_forced_inputs, 128), ('fast', eval_fast_inputs, 128)]
             
-            for mode, inputs_list, max_toks in modes:
+            for mode, inputs_list, max_toks in tqdm(modes, desc=f"Step {step} Eval Modes"):
                 batch_outputs = vllm_engine.generate(inputs_list, {"max_tokens": max_toks, "temperature": 0.7, "n": args.eval_k, "skip_special_tokens": False})
                 if not batch_outputs: continue
                 
-                for idx, uid in enumerate(active_uids):
+                # 👇 修改：为结果的解析过程添加内层进度条 (leave=False 使其处理完自动隐藏)
+                for idx, uid in enumerate(tqdm(active_uids, desc=f"Processing {mode} Results", leave=False)):
                     gt_text = global_history[uid]['gt_text']
                     gt_token_len = len(tokenizer.encode(gt_text, add_special_tokens=False))
                     
@@ -506,20 +496,24 @@ def main():
                     acc = correct_count / args.eval_k
                     step_metrics[uid][f'{mode}_acc'] = acc
                     
-                    # 👇 新增：在 pure 模式下，保存第一个生成的文本，方便事后分析
                     if mode == 'pure' and len(batch_outputs[idx]) > 0:
-                        # 获取第一个生成的序列并解码
                         sample_gen = tokenizer.decode(batch_outputs[idx][0], skip_special_tokens=True)
                         step_metrics[uid]['sample_gen_text'] = sample_gen
-                    # 👆 新增结束
                     
                     if mode == 'pure': total_pure_acc += acc
                     elif mode == 'forced': total_forced_acc += acc
                     elif mode == 'fast': total_fast_acc += acc
+                
+                # 👇 新增：检查并更新 Optimal Latent (仅限 pure 模式评测完后)
+                if mode == 'pure':
+                    for uid in active_uids:
+                        current_pure_acc = step_metrics[uid]['pure_acc']
+                        if current_pure_acc > optimal_latents[uid]["acc"]:
+                            optimal_latents[uid]["acc"] = current_pure_acc
+                            # 深拷贝当前 GPU 上的 Tensor 并转移到 CPU 保存，防止显存爆炸
+                            optimal_latents[uid]["latent"] = global_latents[uid].detach().clone().cpu()
 
-            # 2. 完整记录评测平均值到终端与 WandB
-            print(f"📊 [Eval Results] Pure Acc: {total_pure_acc/len(active_uids):.2%} | Forced Acc: {total_forced_acc/len(active_uids):.2%} | Fast Acc: {total_fast_acc/len(active_uids):.2%}")
-            print(f"📉 [Latent Drift] ROUGE-L: {total_rouge_l/len(active_uids):.4f} | Change Ratio: {total_change_ratio/len(active_uids):.2%}")
+            print(f"📊 [Inter-Eval] Pure: {total_pure_acc/len(active_uids):.2%} | Forced: {total_forced_acc/len(active_uids):.2%} | Fast: {total_fast_acc/len(active_uids):.2%}")
             
             wandb.log({
                 "global_step": step,
@@ -531,7 +525,7 @@ def main():
             })
 
         # --------------------------------------------------
-        # 2.3 Early Stop 动态修剪
+        # 2.3 Early Stop 动态修剪 (挂起，不直接写文件)
         # --------------------------------------------------
         next_active_uids = []
         for uid in active_uids:
@@ -539,30 +533,166 @@ def main():
             
             gt_loss = step_metrics[uid]["gt_loss"]
             if args.early_stop and gt_loss < args.early_stop_threshold:
-                print(f"  🔪 [修剪] 样本 {uid} 达标 (Loss: {gt_loss:.4f})，已写出并移出训练队列。")
-                history_file.write(json.dumps(global_history[uid], ensure_ascii=False) + "\n")
-                history_file.flush()
-                del static_data_cpu[uid] 
+                print(f"  🔪 [修剪] 样本 {uid} 达标 (Loss: {gt_loss:.4f})，移出训练队列等待最终 Eval。")
+                # 释放占用巨大显存的 Logits 分布，保留 Embeddings 供 Final Eval
+                if "topk_probs" in static_data_cpu[uid]:
+                    del static_data_cpu[uid]["topk_probs"]
+                    del static_data_cpu[uid]["topk_indices"]
+                    del static_data_cpu[uid]["grad_mask"]
             else:
                 next_active_uids.append(uid)
                 
         active_uids = next_active_uids
 
-    if active_uids:
-        print(f"\n📁 写入剩余 {len(active_uids)} 个未早停的样本历史...")
-        for uid in active_uids:
-            history_file.write(json.dumps(global_history[uid], ensure_ascii=False) + "\n")
-        history_file.flush()
+    # ==================================================
+    # Phase 3: 终局全量评测 (Final Post-hoc Eval)
+    # ==================================================
+    print("\n" + "="*60)
+    print("🎉 优化循环结束，开始执行全局 Final Evaluation ...")
+    print("="*60)
     
+    all_uids = list(global_history.keys())
+    total_pure_acc, total_forced_acc, total_fast_acc = 0.0, 0.0, 0.0
+    total_rouge_l, total_change_ratio = 0.0, 0.0
+
+    eval_pure_inputs, eval_forced_inputs, eval_fast_inputs = [], [], []
+    
+    for uid in all_uids:
+        ct = global_latents[uid].to(all_embeddings.dtype).detach()
+        sd = static_data_cpu[uid]
+        
+        # 计算最后一次的 ROUGE-L 和 Change Ratio
+        target_flat = ct.squeeze(0)
+        sim = torch.matmul(F.normalize(target_flat, dim=-1), F.normalize(all_embeddings, dim=-1).T)
+        nearest_token_ids = torch.argmax(sim, dim=-1)
+        
+        orig_ids = sd["ids_think"].to(device).squeeze(0)
+        changed_mask = (nearest_token_ids != orig_ids)
+        change_ratio = changed_mask.float().mean().item()
+        
+        decoded_nearest_text = tokenizer.decode(nearest_token_ids).strip()
+        original_thinking_clean = sd['thinking_text']
+        rouge_l_f1 = scorer.score(original_thinking_clean[:10000], decoded_nearest_text[:10000])['rougeL'].fmeasure
+        
+        # 精准写入该 UID 的最后一步 (The exact step it early stopped, or the final step)
+        global_history[uid]["steps"][-1]["metrics"]["change_ratio"] = change_ratio
+        global_history[uid]["steps"][-1]["metrics"]["rouge_L"] = rouge_l_f1
+        
+        total_change_ratio += change_ratio
+        total_rouge_l += rouge_l_f1
+
+        # 准备 vLLM Inputs
+        embeds_q = sd["embeds_q"].to(device)
+        embeds_conn = sd["embeds_conn"].to(device)
+        
+        eval_pure_inputs.append(torch.cat([embeds_q, ct, embeds_end_think], dim=1).squeeze(0))
+        eval_forced_inputs.append(torch.cat([embeds_q, ct, embeds_end_think, embeds_conn], dim=1).squeeze(0))
+        eval_fast_inputs.append(torch.cat([embeds_q, ct, embeds_end_think, embeds_fast_conn], dim=1).squeeze(0))
+
+    modes = [('pure', eval_pure_inputs, 2048), ('forced', eval_forced_inputs, 128), ('fast', eval_fast_inputs, 128)]
+    
+    # 👇 修改：为最终评测添加外层进度条
+    for mode, inputs_list, max_toks in tqdm(modes, desc="Final Eval Modes"):
+        batch_outputs = vllm_engine.generate(inputs_list, {"max_tokens": max_toks, "temperature": 0.7, "n": args.eval_k, "skip_special_tokens": False})
+        if not batch_outputs: continue
+        
+        # 👇 修改：为全量样本解析添加内层进度条
+        for idx, uid in enumerate(tqdm(all_uids, desc=f"Processing {mode} Results", leave=False)):
+            gt_text = global_history[uid]['gt_text']
+            gt_token_len = len(tokenizer.encode(gt_text, add_special_tokens=False))
+            
+            correct_count = 0
+            for output_ids in batch_outputs[idx]:
+                if mode != 'pure': output_ids = output_ids[:gt_token_len]
+                gen_text = tokenizer.decode(output_ids, skip_special_tokens=True)
+                is_corr = False
+                
+                if mode == 'pure':
+                    if is_correct_v3(gen_text, gt_text.replace("}", "")): is_corr = True
+                else:
+                    ans = gen_text.replace("$", "").replace("}", "").strip()
+                    if is_equiv(ans, gt_text.replace("}", "")): is_corr = True
+                
+                if is_corr: correct_count += 1
+                    
+            acc = correct_count / args.eval_k
+            
+            # 精准写入该 UID 的最后一步
+            global_history[uid]["steps"][-1]["metrics"][f'{mode}_acc'] = acc
+            
+            if mode == 'pure' and len(batch_outputs[idx]) > 0:
+                sample_gen = tokenizer.decode(batch_outputs[idx][0], skip_special_tokens=True)
+                global_history[uid]["steps"][-1]["metrics"]['sample_gen_text'] = sample_gen
+            
+            if mode == 'pure': total_pure_acc += acc
+            elif mode == 'forced': total_forced_acc += acc
+            elif mode == 'fast': total_fast_acc += acc
+
+    print(f"📊 [Final Eval Results] Pure Acc: {total_pure_acc/len(all_uids):.2%} | Forced Acc: {total_forced_acc/len(all_uids):.2%} | Fast Acc: {total_fast_acc/len(all_uids):.2%}")
+    print(f"📉 [Final Latent Drift] ROUGE-L: {total_rouge_l/len(all_uids):.4f} | Change Ratio: {total_change_ratio/len(all_uids):.2%}")
+    
+    wandb.log({
+        "global_step": args.steps, # 记录为最后
+        "final/avg_pure_acc": total_pure_acc / len(all_uids),
+        "final/avg_forced_acc": total_forced_acc / len(all_uids),
+        "final/avg_fast_acc": total_fast_acc / len(all_uids),
+        "final/avg_rouge_L": total_rouge_l / len(all_uids),
+        "final/avg_change_ratio": total_change_ratio / len(all_uids)
+    })
+    # ==================================================
+    # Phase 4: 全局落盘 (Deferred File Writing & Tensor Saving)
+    # ==================================================
+    import gzip # 如果开头没引，这里引入也可以
+
+    print(f"📁 正在写入全部 {len(all_uids)} 个样本的完整历史记录...")
+    for uid in all_uids:
+        history_file.write(json.dumps(global_history[uid], ensure_ascii=False) + "\n")
+    history_file.flush()
     history_file.close()
+    
+    try:
+        print(f"💾 正在打包并压缩保存 Optimized Embeddings...")
+        saved_dataset = []
+        for d in raw_data:
+            uid = d['uid']
+            
+            # 1. 提取 Last Embedding 并强制转为 BF16 (砍掉 50% 体积)
+            last_latent = global_latents[uid].detach().cpu().to(torch.bfloat16)
+            
+            # 2. 提取 Optimal Embedding
+            opt_raw = optimal_latents[uid]["latent"]
+            if opt_raw is None:
+                # 优化点：如果没触发过更新，说明 Optimal 就是 Last，没必要存两份
+                opt_latent = None 
+            else:
+                opt_latent = opt_raw.to(torch.bfloat16)
+                
+            # 3. 组装数据包
+            item_pack = {
+                "metadata": d,  
+                "last_optimal_metrics": {
+                    "optimal_pure_acc": max(optimal_latents[uid]["acc"], 0.0)
+                },
+                "tensors": {
+                    # "last_embeds": last_latent,
+                    "optimal_embeds": opt_latent if opt_latent is not None else last_latent      # 读取时如果发现是 None，直接取 last_embeds 即可
+                }
+            }
+            saved_dataset.append(item_pack)
+            
+        # 4. 使用 GZIP 压缩写入 (后缀改为 .pt.gz)
+        tensor_filename = f"./optimization_histories/optimized_embeds_{run_name}.pt.gz"
+        os.makedirs(os.path.dirname(tensor_filename), exist_ok=True)
+        with gzip.open(tensor_filename, 'wb') as f:
+            torch.save(saved_dataset, f)
+            
+        print(f"✅ Embeddings 已成功压缩并保存至 {tensor_filename}")
+    except Exception as e:
+        print(f"⚠️ 保存 Embeddings 时发生错误: {e}")
+    
     wandb.finish()
     vllm_engine.close()
-    print(f"✅ 训练执行完毕！全局记录已存储于 {history_filename}")
+    print(f"🎉 训练彻底结束！")
 
 if __name__ == "__main__":
-    # tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-1.7B", trust_remote_code=True)
-    # wrong_dataset = build_math_wrong_dataset("/workspace/yiqiuguo/lsrl/qwen3-1.7b_math-500_rollout8_len32768_final.jsonl", tokenizer)
-    # print('wrong_dataset: ', len(wrong_dataset))
-    # for i,d in enumerate(wrong_dataset.flat_data):
-    #     print(i,d['uid'])
     main()

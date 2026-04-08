@@ -23,9 +23,10 @@ def vllm_worker_loop(gpu_id, model_name, task_queue, result_queue):
             model=model_name, 
             trust_remote_code=True, 
             tensor_parallel_size=1, 
-            gpu_memory_utilization=0.8, 
+            gpu_memory_utilization=0.95, 
             dtype="float16",
-            enable_prompt_embeds=True
+            enable_prompt_embeds=True,
+            max_model_len=40960
         )
         print(f"✅ [Worker GPU {gpu_id}] 初始化完成，等待任务...")
 
