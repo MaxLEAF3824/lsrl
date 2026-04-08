@@ -23,6 +23,16 @@ from math_utils import is_correct_v3, last_boxed_only_string, remove_boxed, is_e
 from vllm_workers import VLLMDPWorkerPool
 
 # =========================================================================
+# [🌟 架构升级] 辅助函数：跨设备搬运优化器状态
+# =========================================================================
+def move_optimizer_state(optimizer, device):
+    """将原生优化器的内部张量状态（如动量 exp_avg 等）搬运到指定设备"""
+    for param, state in optimizer.state.items():
+        for k, v in state.items():
+            if isinstance(v, torch.Tensor):
+                state[k] = v.to(device)
+
+# =========================================================================
 # [1] 数据集与内存优化管理
 # =========================================================================
 class MathWrongDataset(Dataset):
@@ -161,12 +171,11 @@ def main():
 
     wrong_dataset = build_math_wrong_dataset(args.file_path, tokenizer)
     raw_data = wrong_dataset.flat_data
-    # raw_data = raw_data[73:80]
 
     # ==================================================
-    # Phase 1: 构建 CPU 静态缓存 & CPU 潜变量注册表
+    # Phase 1: 构建 CPU 静态缓存 & CPU 潜变量注册表 (Batch 优化版)
     # ==================================================
-    print("⚙️ Preparing Static Data & Latents (CPU Offloading)...")
+    print("⚙️ Preparing Static Data & Latents (Batch Forwarding)...")
     static_data_cpu = {}
     global_latents = torch.nn.ParameterDict()
     active_uids = []
@@ -176,57 +185,104 @@ def main():
         for d in raw_data
     }
 
-    for d in tqdm(raw_data, desc="Pre-computing"):
-        uid = d['uid']
-        active_uids.append(uid)
+    # 设置预处理的 Batch Size
+    prep_batch_size = args.batch_size
+    for i in tqdm(range(0, len(raw_data), prep_batch_size), desc="Pre-computing (Batched)"):
+        batch_samples = raw_data[i : i + prep_batch_size]
         
-        embeds_q, ids_q = get_embeds(d['question_text'])
-        embeds_conn, ids_conn = get_embeds(d['connector_text']) if args.conn_type == "original" else (embeds_fast_conn, ids_fast_conn)
-        embeds_gt, ids_gt = get_embeds(d['gt_text'])
-        embeds_pred, ids_pred = get_embeds(d['pred_text'])
-        embeds_think, ids_think = get_embeds(d['thinking_text'])
+        batch_embeds_full = []
+        batch_info = []
         
-        # 参数强制初始化在 CPU
-        curr_think = torch.nn.Parameter(embeds_think.detach().cpu().clone())
-        global_latents[uid] = curr_think
-        
-        with torch.no_grad():
-            orig_full = torch.cat([embeds_q, embeds_think, embeds_end_think, embeds_conn], dim=1)
-            orig_out = model(inputs_embeds=orig_full)
+        for d in batch_samples:
+            uid = d['uid']
+            active_uids.append(uid)
+            
+            # 获取各部分 Embeddings
+            embeds_q, ids_q = get_embeds(d['question_text'])
+            embeds_conn, ids_conn = get_embeds(d['connector_text']) if args.conn_type == "original" else (embeds_fast_conn, ids_fast_conn)
+            embeds_gt, ids_gt = get_embeds(d['gt_text'])
+            embeds_pred, ids_pred = get_embeds(d['pred_text'])
+            embeds_think, ids_think = get_embeds(d['thinking_text'])
+            
+            # 初始化 Latent (在 CPU)
+            curr_think = torch.nn.Parameter(embeds_think.detach().cpu().clone())
+            global_latents[uid] = curr_think
+            
+            # 记录位置信息
             think_start_idx = ids_q.shape[1] - 1
             think_end_idx = think_start_idx + ids_think.shape[1]
-            orig_probs = F.softmax(orig_out.logits[:, think_start_idx:think_end_idx, :], dim=-1)
             
+            full_emb = torch.cat([embeds_q, embeds_think, embeds_end_think, embeds_conn], dim=1)
+            batch_embeds_full.append(full_emb)
+            
+            batch_info.append({
+                "uid": uid, "ids_q": ids_q, "ids_conn": ids_conn, "ids_gt": ids_gt,
+                "ids_pred": ids_pred, "ids_think": ids_think, "thinking_text": d['thinking_text'],
+                "start": think_start_idx, "end": think_end_idx, "len": full_emb.shape[1]
+            })
+
+        # --- Batch Forward 开始 ---
+        max_len = max(info["len"] for info in batch_info)
+        padded_embeds = []
+        attn_masks = []
+        
+        for j, emb in enumerate(batch_embeds_full):
+            diff = max_len - emb.shape[1]
+            if diff > 0:
+                pad = torch.zeros((1, diff, emb.shape[2]), device=device, dtype=model.dtype)
+                padded_embeds.append(torch.cat([emb, pad], dim=1))
+                mask = torch.cat([torch.ones(emb.shape[1]), torch.zeros(diff)]).to(device)
+            else:
+                padded_embeds.append(emb)
+                mask = torch.ones(max_len).to(device)
+            attn_masks.append(mask.unsqueeze(0))
+
+        with torch.no_grad():
+            outputs = model(inputs_embeds=torch.cat(padded_embeds, dim=0), 
+                           attention_mask=torch.cat(attn_masks, dim=0))
+            all_logits = outputs.logits # [B, L, Vocab]
+
+        # --- 处理与存储结果 ---
+        for j, info in enumerate(batch_info):
+            uid = info["uid"]
+            # 提取该样本对应的 thinking 部分的 logits
+            think_logits = all_logits[j, info["start"]:info["end"], :].unsqueeze(0)
+            probs = F.softmax(think_logits, dim=-1)
+            
+            # 计算 Entropy Mask
             if args.mask_strategy == "top_k_entropy":
-                entropy = -torch.sum(orig_probs * torch.log(orig_probs + 1e-10), dim=-1)
+                entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)
                 mask = torch.zeros_like(entropy, dtype=torch.float32)
                 mask.scatter_(1, torch.topk(entropy, k=min(args.mask_max_k, entropy.shape[1]), dim=1).indices, 1.0)
             else:
-                mask = torch.zeros_like(ids_think, dtype=torch.float32)
+                mask = torch.zeros((1, info["ids_think"].shape[1]), dtype=torch.float32, device=device)
                 mask[:, :args.mask_max_k] = 1.0
-                
-            topk_probs, topk_indices = torch.topk(orig_probs, k=100, dim=-1)
             
-            # 剔除 embeds_*，仅保留轻量级 IDs 和标量张量
+            topk_probs, topk_indices = torch.topk(probs, k=100, dim=-1)
+            
             static_data_cpu[uid] = {
-                "ids_q": ids_q.cpu(), 
-                "ids_conn": ids_conn.cpu(), 
-                "ids_gt": ids_gt.cpu(), 
-                "ids_pred": ids_pred.cpu(), 
-                "ids_think": ids_think.cpu(),
+                "ids_q": info["ids_q"].cpu(), 
+                "ids_conn": info["ids_conn"].cpu(), 
+                "ids_gt": info["ids_gt"].cpu(), 
+                "ids_pred": info["ids_pred"].cpu(), 
+                "ids_think": info["ids_think"].cpu(),
                 "grad_mask": mask.unsqueeze(-1).cpu(),
                 "topk_probs": topk_probs.cpu(), 
                 "topk_indices": topk_indices.cpu(),
-                "thinking_text": d['thinking_text']
+                "thinking_text": info['thinking_text']
             }
-            del orig_full, orig_out, orig_probs
-            
+        
+        # 显存清理
+        del all_logits, outputs, padded_embeds, attn_masks, batch_embeds_full
     torch.cuda.empty_cache()
     
     optimal_latents = {uid: {"acc": -1.0, "latent": None} for uid in global_latents.keys()}
     
+    # [🌟 架构升级] 为每个数据单独实例化优化器对象，状态持久化在 CPU 内存中
+    global_opts = {}
     if args.optimizer == "adam":
-        optimizer = torch.optim.Adam(global_latents.values(), lr=args.learning_rate)
+        for uid, param in global_latents.items():
+            global_opts[uid] = torch.optim.Adam([param], lr=args.learning_rate)
     elif args.optimizer == "frank_wolfe":
         optimizer = FrankWolfeOptimizer(all_embeddings)
 
@@ -255,9 +311,6 @@ def main():
         current_lr = (args.learning_rate * 0.1) + (args.learning_rate * 0.9) * cosine_factor
         current_fw_gamma = (args.fw_gamma * 0.1) + (args.fw_gamma * 0.9) * cosine_factor
         
-        if args.optimizer == "adam":
-            for pg in optimizer.param_groups: pg['lr'] = current_lr
-        
         step_metrics = {uid: {} for uid in active_uids}
         epoch_gt_loss_sum, epoch_kl_loss_sum, epoch_lm_loss_sum, epoch_total_loss_sum = 0.0, 0.0, 0.0, 0.0
         
@@ -271,12 +324,6 @@ def main():
         pbar = tqdm(mini_batches, desc=f"Step {step+1} Optimizing")
         
         for batch_uids in pbar:
-            if args.optimizer == "adam": 
-                optimizer.zero_grad(set_to_none=True)
-            elif args.optimizer == "frank_wolfe":
-                for uid in batch_uids:
-                    if global_latents[uid].grad is not None: global_latents[uid].grad.zero_()
-
             curr_think_list, curr_mask_list = [], []
             embeds_q_list, embeds_conn_list, embeds_gt_list, embeds_pred_list = [], [], [], []
             ids_q_list, ids_think_list, ids_conn_list, ids_gt_list, ids_pred_list = [], [], [], [], []
@@ -285,9 +332,21 @@ def main():
                 sd = static_data_cpu[uid]
                 curr_mask_list.append(sd["grad_mask"].to(device))
                 
-                # 发送 latent 到 GPU 用于计算图构建
-                curr_latent_gpu = global_latents[uid].to(device).detach().requires_grad_(True)
-                curr_think_list.append(curr_latent_gpu)
+                # [🌟 架构升级] 按需加载：将参数原地变更为 GPU 张量
+                p = global_latents[uid]
+                p.data = p.data.to(device)
+                if p.grad is not None:
+                    p.grad.data = p.grad.data.to(device)
+                curr_think_list.append(p)
+                
+                # [🌟 架构升级] 针对本 Batch 的数据，将 Adam 状态拉上 GPU 并更新 LR
+                if args.optimizer == "adam":
+                    opt = global_opts[uid]
+                    move_optimizer_state(opt, device)
+                    for pg in opt.param_groups:
+                        pg['lr'] = current_lr
+                elif args.optimizer == "frank_wolfe":
+                    if p.grad is not None: p.grad.zero_()
                 
                 # 动态获取 Embeddings
                 with torch.no_grad():
@@ -310,6 +369,7 @@ def main():
             full_embeds_list = []
             for i in range(len(batch_uids)):
                 target_emb = embeds_gt_list[i] if args.grad_direction == "positive" else embeds_pred_list[i]
+                # 注意此处 curr_think_list[i] 在 GPU 上
                 full_embeds_list.append(torch.cat([embeds_q_list[i], curr_think_list[i].to(model.dtype), embeds_end_think, embeds_conn_list[i], target_emb], dim=1))
 
             max_len = max(emb.shape[1] for emb in full_embeds_list)
@@ -373,15 +433,15 @@ def main():
                     scaled_embeds_chunk = embeds_chunk * (orig_norm / (curr_norm + 1e-8))
                     
                     score_0_chunk = (h_chunk * scaled_embeds_chunk).sum(dim=-1) 
-                    mask = torch.zeros_like(logits_chunk, dtype=torch.bool)
-                    mask.scatter_(2, target_ids_chunk.unsqueeze(-1), True)
+                    mask_chunk = torch.zeros_like(logits_chunk, dtype=torch.bool)
+                    mask_chunk.scatter_(2, target_ids_chunk.unsqueeze(-1), True)
                     
-                    new_logits_chunk = torch.where(mask, score_0_chunk.unsqueeze(-1), logits_chunk)
+                    new_logits_chunk = torch.where(mask_chunk, score_0_chunk.unsqueeze(-1), logits_chunk)
                     logprobs_sum += (score_0_chunk - torch.logsumexp(new_logits_chunk, dim=-1)).sum()
                     
                     del h_chunk, logits_chunk, lse_chunk, orig_p_chunk, orig_idx_chunk
                     del curr_log_probs_topk_chunk, kl_chunk, embeds_chunk, target_ids_chunk
-                    del orig_embeds_chunk, scaled_embeds_chunk, score_0_chunk, mask, new_logits_chunk
+                    del orig_embeds_chunk, scaled_embeds_chunk, score_0_chunk, mask_chunk, new_logits_chunk
                     
                 all_kl_div_list.append(kl_sum / think_len)
                 batch_logprobs.append(logprobs_sum / think_len)
@@ -416,15 +476,29 @@ def main():
             
             total_loss.backward()
             
-            # 手工回传梯度到 CPU 的 Parameter
-            for uid, mask, latent_gpu in zip(batch_uids, curr_mask_list, curr_think_list):
-                grad_gpu = latent_gpu.grad * mask.to(latent_gpu.dtype)
-                global_latents[uid].grad = grad_gpu.cpu() 
+            # [🌟 架构升级] 在 GPU 上应用 Mask，执行 Optimizer Step，随后释放回 CPU
+            for i, uid in enumerate(batch_uids):
+                p = curr_think_list[i]  # p 本质上就是 global_latents[uid]
+                mask = curr_mask_list[i]
                 
-            if args.optimizer == "adam": optimizer.step()
-            elif args.optimizer == "frank_wolfe":
-                for uid in batch_uids:
-                    optimizer.step(global_latents[uid], gamma=current_fw_gamma)
+                if p.grad is not None:
+                    # 在 GPU 上施加 Mask
+                    p.grad.data.mul_(mask.to(device).to(p.dtype))
+                
+                if args.optimizer == "adam":
+                    opt = global_opts[uid]
+                    # 在 GPU 执行高性能 Step 计算
+                    opt.step()
+                    # 清理该样本在 GPU 的梯度释放显存
+                    opt.zero_grad(set_to_none=True)
+                    # 将更新后的动量状态搬回 CPU 进行持久化
+                    move_optimizer_state(opt, torch.device("cpu"))
+                elif args.optimizer == "frank_wolfe":
+                    # FW 原地修改参数，它接受当前在 GPU 的张量 p
+                    optimizer.step(p, gamma=current_fw_gamma)
+
+                # 将 Latent 数据本身搬回 CPU，且确保持续存在于 Pinned Memory 中以加速后续轮次
+                p.data = p.data.cpu().pin_memory()
 
             del full_embeds_batch, full_attention_mask, last_hidden
             torch.cuda.empty_cache()
@@ -450,6 +524,7 @@ def main():
             eval_pure_inputs, eval_forced_inputs, eval_fast_inputs = [], [], []
             
             for uid in active_uids:
+                # 此时 global_latents[uid] 的 .data 均安稳地停留在 CPU，不会 OOM
                 ct = global_latents[uid].to(device).to(all_embeddings.dtype).detach()
                 sd = static_data_cpu[uid]
                 
@@ -519,8 +594,8 @@ def main():
                         current_pure_acc = step_metrics[uid]['pure_acc']
                         if current_pure_acc > optimal_latents[uid]["acc"]:
                             optimal_latents[uid]["acc"] = current_pure_acc
-                            # 保存到 CPU，防止显存爆炸
-                            optimal_latents[uid]["latent"] = global_latents[uid].detach().clone().cpu()
+                            # 此刻 global_latents 本身就在 CPU，安全赋值
+                            optimal_latents[uid]["latent"] = global_latents[uid].detach().clone()
 
             print(f"📊 [Inter-Eval] Pure: {total_pure_acc/len(active_uids):.2%} | Forced: {total_forced_acc/len(active_uids):.2%} | Fast: {total_fast_acc/len(active_uids):.2%}")
             
@@ -659,8 +734,8 @@ def main():
             
             opt_raw = optimal_latents[uid]["latent"]
             if opt_raw is None:
-                # 若未更新过或初始即最优，取当前 CPU state
-                opt_raw = global_latents[uid].detach().cpu()
+                # 已经是安全的 CPU Tensor 
+                opt_raw = global_latents[uid].detach().clone()
                 
             int8_latent, scale = quantize_to_int8(opt_raw)
             

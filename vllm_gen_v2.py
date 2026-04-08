@@ -45,7 +45,8 @@ def run_inference(rank, data_chunk, run_id, model_id, sampling_kwargs):
     
     for item in data_chunk:
         # 兼容不同数据集的题目字段名 (MATH 是 problem, OlympiadBench 等可能是 question)
-        question_text = item.get('problem', item.get('question', item.get('problem_v1', None)))
+        # question_text = item.get('problem', item.get('question', item.get('problem_v1', None)))
+        question_text = item.get('q', None)
         
         # prompt_text = prompt_template.format(question=question_text)
         messages = [{"role": "user", "content": question_text}]
@@ -102,16 +103,33 @@ if __name__ == "__main__":
     # 根据不同的 DATASET_ID 处理特定的 split 逻辑
     if args.DATASET_ID == "HuggingFaceH4/MATH-500":
         dataset = load_dataset(args.DATASET_ID, split='test')
+        q_key = "problem"
     elif args.DATASET_ID == "KbsdJames/Omni-MATH":
         dataset = load_dataset(args.DATASET_ID, split='test')
+        q_key = "problem"
     elif args.DATASET_ID == "Hothan/OlympiadBench":
         dataset = load_dataset(args.DATASET_ID, name="OE_TO_maths_en_COMP", split='train')
+        q_key = "problem_v1"
     elif args.DATASET_ID == "math-ai/amc23":
         dataset = load_dataset(args.DATASET_ID, split='test')
+        q_key = "question"
+    elif args.DATASET_ID == "mnoukhov/dapo_math_14k_en_openinstruct":
+        dataset = load_dataset(args.DATASET_ID, split='train')
+        q_key = "prompt"
+    elif args.DATASET_ID == "openai/gsm8k":
+        ds = load_dataset("openai/gsm8k", "main", split='test')
+        q_key = "question"
+    elif args.DATASET_ID == "HuggingFaceH4/aime_2024":
+        dataset = load_dataset(args.DATASET_ID, split='train')
+        q_key = "problem"
+    elif args.DATASET_ID == "math-ai/aime25":
+        dataset = load_dataset(args.DATASET_ID, split='test')
+        q_key = "problem"
     else:
         dataset = load_dataset(args.DATASET_ID, split='test')
+        q_key = "problem"
     
-    all_data = [item for item in dataset]
+    all_data = [item|{"q": q_key} for item in dataset]
     total_len = len(all_data)
     
     chunk_size = (total_len + args.NUM_GPUS - 1) // args.NUM_GPUS

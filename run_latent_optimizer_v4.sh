@@ -20,13 +20,13 @@ CHUNK_SIZE=1024
 
 echo "🚀 开始启动Latent Optimization训练..."
 
-python /workspace/yiqiuguo/lsrl/latent_optimizer_v2.py \
+python /workspace/yiqiuguo/lsrl/latent_optimizer_v4.py \
     --model_name "$MODEL" \
     --file_path "$DATA_FILE" \
     --vllm_gpus 1 2 3 \
     --batch_size $BATCH_SIZE \
     --chunk_size $CHUNK_SIZE \
-    --optimizer "adam" \
+    --optimizer "frank_wolfe" \
     --learning_rate 2e-3 \
     --fw_gamma 0.1 \
     --steps 50 \

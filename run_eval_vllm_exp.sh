@@ -6,18 +6,19 @@
 
 # 1. 定义要评测的模型列表
 MODELS=(
-    "Qwen/Qwen3-0.6B"
-    # "Qwen/Qwen3-1.7B"
+    # "Qwen/Qwen3-0.6B"
+    "Qwen/Qwen3-1.7B"
     # "Qwen/Qwen2.5-1.5B-Instruct"
     # "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 )
 
 # 2. 定义要评测的数据集列表
 DATASETS=(
-    "HuggingFaceH4/MATH-500"
-    "KbsdJames/Omni-MATH"
-    "Hothan/OlympiadBench"
-    "math-ai/amc23"
+    # "HuggingFaceH4/MATH-500"
+    # "KbsdJames/Omni-MATH"
+    # "Hothan/OlympiadBench"
+    # "math-ai/amc23"
+    "mnoukhov/dapo_math_14k_en_openinstruct"
 )
 
 # 3. 固定的采样和硬件参数
