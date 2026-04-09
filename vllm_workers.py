@@ -1,21 +1,21 @@
-# vllm_workers.py
 import multiprocessing as mp
 import math
 import traceback
 import signal
 import torch
+import os
 
 def vllm_worker_loop(gpu_id, model_name, task_queue, result_queue):
     """运行在独立子进程中的 vLLM Worker"""
-    import os
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     
-    # 【核心防御】：让子进程忽略 Jupyter 发出的中断信号 (KeyboardInterrupt)
-    # 这样只有当主进程通过 Queue 发送 None 时，子进程才会退出
+    # [🔥 修复点 1] 强行禁用 V1 引擎的多进程隔离，确保向后兼容性
+    os.environ["VLLM_USE_V1"] = "0"
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     
     try:
-        import torch
         from vllm import LLM, SamplingParams
         
         print(f"🚀 [Worker GPU {gpu_id}] 正在初始化 vLLM 引擎...")
@@ -35,25 +35,91 @@ def vllm_worker_loop(gpu_id, model_name, task_queue, result_queue):
             if task is None: 
                 break
                 
-            task_idx, embeds_list, sp_dict = task
-            sp = SamplingParams(**sp_dict)
+            task_type = task.get('type')
             
-            inputs = [{"prompt_embeds": torch.tensor(emb, dtype=torch.float16)} for emb in embeds_list]
-            outputs = llm.generate(prompts=inputs, sampling_params=sp, use_tqdm=False)
-            
-            batch_res = []
-            for out in outputs:
-                req_res = []
-                for comp in out.outputs:
-                    req_res.append(list(comp.token_ids))
-                batch_res.append(req_res)
+            # =============== 处理推理请求 ===============
+            if task_type == 'GENERATE':
+                task_idx = task['task_idx']
+                sp_dict = task['sp_dict']
+                sp = SamplingParams(**sp_dict)
                 
-            result_queue.put((task_idx, batch_res))
-            
+                if 'embeds_list' in task and task['embeds_list']:
+                    inputs = [{"prompt_embeds": torch.tensor(emb, dtype=torch.float16)} for emb in task['embeds_list']]
+                elif 'prompts_list' in task and task['prompts_list']:
+                    inputs = task['prompts_list'] 
+                else:
+                    inputs = []
+
+                outputs = llm.generate(prompts=inputs, sampling_params=sp, use_tqdm=False)
+                
+                batch_res = []
+                for out in outputs:
+                    req_res = []
+                    for comp in out.outputs:
+                        req_res.append(list(comp.token_ids))
+                    batch_res.append(req_res)
+                    
+                result_queue.put(('GENERATE_DONE', task_idx, batch_res))
+                
+            # =============== 处理权重更新请求 ===============
+            elif task_type == 'UPDATE_WEIGHTS':
+                payload = task['payload']
+                print(f"🔄 [Worker GPU {gpu_id}] 开始热更新权重...")
+                
+                # [🔥 修复点 2] 兼容 vLLM 0.8.x+ 的 RPC 架构
+                if hasattr(llm, 'collective_rpc'):
+                    # 新版 vLLM 推荐使用 RPC 向底层 Worker 下发函数
+                    def worker_load_weights(worker):
+                        import torch
+                        if isinstance(payload, str):
+                            if payload.endswith('.safetensors'):
+                                from safetensors.torch import load_file
+                                state_dict = load_file(payload)
+                            else:
+                                state_dict = torch.load(payload, map_location="cpu")
+                        else:
+                            state_dict = payload
+                        
+                        # 此时运行在底层 worker 环境中，直接拿到 model 赋值
+                        worker.model_runner.model.load_weights(state_dict.items())
+                        del state_dict
+                        torch.cuda.empty_cache()
+                    
+                    llm.collective_rpc(worker_load_weights)
+                
+                # 旧版 vLLM 兼容逻辑
+                else:
+                    if isinstance(payload, str):
+                        if payload.endswith('.safetensors'):
+                            from safetensors.torch import load_file
+                            hf_state_dict = load_file(payload)
+                        else:
+                            hf_state_dict = torch.load(payload, map_location="cpu")
+                    else:
+                        hf_state_dict = payload
+                    
+                    # 因为前面注入了环境变量，这里保证能取到 model_executor
+                    executor = llm.llm_engine.model_executor
+                    if hasattr(executor, 'driver_worker'):
+                        model = executor.driver_worker.model_runner.model
+                    elif hasattr(executor, 'last_worker'):
+                        model = executor.last_worker.model_runner.model
+                    elif hasattr(executor, 'model'):
+                        model = executor.model
+                    else:
+                        raise AttributeError("无法定位 vLLM 内部的 PyTorch 模型。")
+                    
+                    model.load_weights(hf_state_dict.items())
+                    del hf_state_dict
+                    torch.cuda.empty_cache()
+                
+                print(f"✅ [Worker GPU {gpu_id}] 权重更新完成！")
+                result_queue.put(('UPDATE_DONE', gpu_id, "SUCCESS"))
+
     except Exception as e:
         error_msg = traceback.format_exc()
-        print(f"\n❌ [Worker GPU {gpu_id}] 发生致命错误:\n{error_msg}\n")
-        result_queue.put((-1, error_msg))
+        print(f"\n❌ [Worker GPU {gpu_id}] 发生错误:\n{error_msg}\n")
+        result_queue.put(('ERROR', gpu_id, error_msg))
 
 
 class VLLMDPWorkerPool:
@@ -77,7 +143,6 @@ class VLLMDPWorkerPool:
             self.workers.append(p)
             
     def clear_queues(self):
-        """【新增】：用于在主进程中断后，清理队列里上一轮残留的数据，防止新旧数据错乱"""
         while not self.task_queue.empty():
             try: self.task_queue.get_nowait()
             except: pass
@@ -85,26 +150,37 @@ class VLLMDPWorkerPool:
             try: self.result_queue.get_nowait()
             except: pass
 
-    def generate(self, inputs_embeds_list, sampling_params_dict):
-        total_prompts = len(inputs_embeds_list)
+    def generate(self, inputs_list, sampling_params_dict, input_type="embeds"):
+        total_prompts = len(inputs_list)
         if total_prompts == 0:
             return []
             
         chunk_size = math.ceil(total_prompts / self.num_workers)
-        chunks = [inputs_embeds_list[i:i + chunk_size] for i in range(0, total_prompts, chunk_size)]
+        chunks = [inputs_list[i:i + chunk_size] for i in range(0, total_prompts, chunk_size)]
         
         active_tasks = 0
         for idx, chunk in enumerate(chunks):
             if len(chunk) > 0:
-                np_chunk = [emb.detach().cpu().to(torch.float16).numpy() for emb in chunk]
-                self.task_queue.put((idx, np_chunk, sampling_params_dict))
+                task_dict = {
+                    'type': 'GENERATE',
+                    'task_idx': idx,
+                    'sp_dict': sampling_params_dict
+                }
+                if input_type == "embeds":
+                    task_dict['embeds_list'] = [emb.detach().cpu().to(torch.float16).numpy() for emb in chunk]
+                else:
+                    task_dict['prompts_list'] = chunk
+                    
+                self.task_queue.put(task_dict)
                 active_tasks += 1
                 
         results = {}
         for _ in range(active_tasks):
-            idx, res = self.result_queue.get()
-            if idx == -1:
-                raise RuntimeError(f"vLLM 子进程崩溃，错误信息：\n{res}")
+            res_tuple = self.result_queue.get()
+            if res_tuple[0] == 'ERROR':
+                _, gpu_id, error_msg = res_tuple
+                raise RuntimeError(f"vLLM Worker {gpu_id} 崩溃:\n{error_msg}")
+            _, idx, res = res_tuple
             results[idx] = res
             
         final_batch_token_ids = []
@@ -113,6 +189,21 @@ class VLLMDPWorkerPool:
             
         return final_batch_token_ids
         
+    def update_weights(self, state_dict_or_path):
+        for _ in range(self.num_workers):
+            self.task_queue.put({'type': 'UPDATE_WEIGHTS', 'payload': state_dict_or_path})
+            
+        success_count = 0
+        for _ in range(self.num_workers):
+            res_tuple = self.result_queue.get()
+            if res_tuple[0] == 'ERROR':
+                _, gpu_id, error_msg = res_tuple
+                raise RuntimeError(f"vLLM Worker {gpu_id} 权重更新失败:\n{error_msg}")
+            res_type, gpu_id, status = res_tuple
+            if res_type == 'UPDATE_DONE' and status == "SUCCESS":
+                success_count += 1
+        print(f"🌟 成功热更新了 {success_count} 个 Worker 的权重。")
+
     def close(self):
         for _ in self.workers:
             self.task_queue.put(None)

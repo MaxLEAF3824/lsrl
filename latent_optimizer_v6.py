@@ -93,7 +93,7 @@ def build_math_wrong_dataset(file_path: str, tok: AutoTokenizer) -> MathWrongDat
     return MathWrongDataset(new_wrong_data, tok)
 
 # =========================================================================
-# [2] 优化器定义
+# [2] 优化器定义 & 量化工具
 # =========================================================================
 class FrankWolfeOptimizer:
     def __init__(self, vocab_embeddings):
@@ -115,7 +115,7 @@ def quantize_to_int8(tensor):
     return int8_tensor, scale
 
 # =========================================================================
-# [3] 主流程
+# [3] 主流程 (支持易并行切片)
 # =========================================================================
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -138,19 +138,18 @@ def parse_args():
     parser.add_argument("--reg_type", type=str, default="kl", choices=["kl", "lm"])
     parser.add_argument("--early_stop", action="store_true")
     parser.add_argument("--early_stop_threshold", type=float, default=1e-3)
-    parser.add_argument("--distill_epochs", type=int, default=3)
-    parser.add_argument("--distill_lr", type=float, default=2e-5)
-    parser.add_argument("--distill_ce_loss_weight", type=float, default=1.0)
-    parser.add_argument("--distill_eval_every", type=int, default=20, help="每多少步执行一次蒸馏评测")
-    parser.add_argument("--distill_sample_filter", action="store_true", help="是否剔除没有优化的样本")
-    parser.add_argument("--distill_eval_datasets", type=str, nargs='+', default=["HuggingFaceH4/MATH-500"])
-    parser.add_argument("--distill_batch_size", type=int, default=4)
-    parser.add_argument("--distill_grad_accum_steps", type=int, default=4)
+    
+    # [新增] 并行切片参数
+    parser.add_argument("--NODE_TOTAL", type=int, default=1, help="总节点数")
+    parser.add_argument("--NODE_RANK", type=int, default=0, help="当前节点编号 (0开始)")
     return parser.parse_args()
 
 def main():
     args = parse_args()
-    wandb.init(project="L-GRPO-Math500", config=vars(args))
+    
+    # 为了防止多个节点写入 WandB 时 run_name 冲突，可以在项目名或 run_name 里加上 node_rank
+    run_name_prefix = f"opt_v2_{args.optimizer}_{args.reg_type}"
+    wandb.init(project="L-GRPO-Math500-Optimize", name=f"{run_name_prefix}_node{args.NODE_RANK}", config=vars(args))
     wandb.define_metric("global_step")
     wandb.define_metric("train/*", step_metric="global_step")
     wandb.define_metric("eval/*", step_metric="global_step")
@@ -177,7 +176,18 @@ def main():
     scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
 
     wrong_dataset = build_math_wrong_dataset(args.file_path, tokenizer)
-    raw_data = wrong_dataset.flat_data
+    all_data = wrong_dataset.flat_data
+    
+    # =========================================================================
+    # [🌟 核心修改] 易并行切片逻辑 (Embarrassingly Parallel)
+    # =========================================================================
+    global_total_len = len(all_data)
+    node_chunk_size = (global_total_len + args.NODE_TOTAL - 1) // args.NODE_TOTAL
+    start_idx = args.NODE_RANK * node_chunk_size
+    end_idx = min(start_idx + node_chunk_size, global_total_len)
+    
+    raw_data = all_data[start_idx:end_idx] # 当前节点专属数据
+    print(f"🌍 集群切片状态: 本节点 {args.NODE_RANK}/{args.NODE_TOTAL-1} | 负责全局索引 {start_idx} ~ {end_idx-1} (共 {len(raw_data)} 题)")
 
     # --- Phase 1 ---
     print("⚙️ Preparing Static Data & Latents (Batch Forwarding)...")
@@ -279,23 +289,18 @@ def main():
     elif args.optimizer == "frank_wolfe":
         optimizer = FrankWolfeOptimizer(all_embeddings)
 
-    run_name = wandb.run.name if wandb.run is not None else f"opt_v2_{args.optimizer}_{args.reg_type}"
-    history_filename = f"./optimization_histories/optimization_history_{run_name}.jsonl"
+    # [🌟 修改点]：给输出文件加上 _nodeX 后缀防覆盖
+    history_filename = f"./optimization_histories/optimization_history_{run_name_prefix}_node{args.NODE_RANK}.jsonl"
     os.makedirs(os.path.dirname(history_filename), exist_ok=True)
     
-    # [新增] 专门用于覆盖更新历史文件的闭包函数
     def save_current_history():
         tmp_filename = history_filename + ".tmp"
         with open(tmp_filename, "w", encoding="utf-8") as f:
-            # 永远保持第一行是 config
             f.write(json.dumps({"config": vars(args)}, ensure_ascii=False) + "\n")
-            # 遍历写入所有 sample 的最新状态
             for u in global_history.keys():
                 f.write(json.dumps(global_history[u], ensure_ascii=False) + "\n")
-        # 原子替换，防止读取时文件不完整
         os.replace(tmp_filename, history_filename)
 
-    # 初始写入一次
     save_current_history()
 
     # ==================================================
@@ -306,11 +311,7 @@ def main():
 
     def run_eval_async(eval_step, eval_uids, latents_snapshot):
         try:
-            # 强行注入独立的 Event Loop，避免 vLLM 的异步机制在子线程中崩溃
             asyncio.set_event_loop(asyncio.new_event_loop())
-
-            # [🌟 算力物理隔离] 获取第一个 vLLM 分配的 GPU（如 cuda:1）
-            # 这样潜空间漂移计算就完全不会干扰 GPU 0 上的训练前向和反向传播
             eval_device_id = args.vllm_gpus[0] if args.vllm_gpus else 0
             eval_device = torch.device(f"cuda:{eval_device_id}")
 
@@ -321,7 +322,6 @@ def main():
             eval_pure_inputs, eval_forced_inputs, eval_fast_inputs = [], [], []
             step_metrics = {uid: {} for uid in eval_uids}
             
-            # [🔥 GPU 物理隔离] 将全量词表移至 Eval 专属 GPU 并执行归一化
             with torch.no_grad():
                 all_embeddings_norm_eval_gpu = F.normalize(all_embeddings_cpu.to(eval_device), dim=-1)
             
@@ -333,23 +333,14 @@ def main():
                 L = target_flat.shape[0]
                 nearest_token_ids = torch.empty(L, dtype=torch.long)
                 
-                # [🔥 GPU Chunked 计算] 限制每次计算量，防止挤爆 vLLM 的显存
-                drift_chunk_size = 2048  # 大约只产生 150MB 左右的峰值显存占用
+                drift_chunk_size = 2048 
                 with torch.no_grad():
                     for c_start in range(0, L, drift_chunk_size):
                         c_end = min(c_start + drift_chunk_size, L)
-                        
-                        # 1. 搬运 Chunk 到 Eval GPU
                         chunk_eval_gpu = target_flat[c_start:c_end].to(eval_device, non_blocking=True)
                         chunk_norm = F.normalize(chunk_eval_gpu, dim=-1)
-                        
-                        # 2. 在 Eval GPU 上执行矩阵乘法 [chunk, D] @ [D, Vocab]
                         sim_chunk = torch.matmul(chunk_norm, all_embeddings_norm_eval_gpu.T)
-                        
-                        # 3. 得到结果立马送回 CPU 保存
                         nearest_token_ids[c_start:c_end] = torch.argmax(sim_chunk, dim=-1).cpu()
-                        
-                        # 4. 及时清理垃圾释放 Eval GPU 显存
                         del chunk_eval_gpu, chunk_norm, sim_chunk
                 
                 orig_ids = sd["ids_think"].squeeze(0)
@@ -373,16 +364,13 @@ def main():
                 eval_forced_inputs.append(torch.cat([embeds_q_cpu, ct_cpu, embeds_end_think_cpu, embeds_conn_cpu], dim=1).squeeze(0))
                 eval_fast_inputs.append(torch.cat([embeds_q_cpu, ct_cpu, embeds_end_think_cpu, embeds_fast_conn_cpu], dim=1).squeeze(0))
 
-            # 清理 Eval GPU 上的全局归一化词表，彻底打扫战场
             del all_embeddings_norm_eval_gpu
-            # 注意这里要清理特定的 Eval GPU
             with torch.cuda.device(eval_device):
                 torch.cuda.empty_cache()
 
             tqdm.write(f"⚡ [后台评测] 漂移计算完毕，准备发送数据至 vLLM Worker...")
             modes = [('pure', eval_pure_inputs, 2048), ('forced', eval_forced_inputs, 128), ('fast', eval_fast_inputs, 128)]
             
-            # 这里移除所有的 TQDM，防止破坏主线程的进度条
             for mode, inputs_list, max_toks in modes:
                 tqdm.write(f"   --> vLLM 正在并行生成 {mode} 模式...")
                 batch_outputs = vllm_engine.generate(inputs_list, {"max_tokens": max_toks, "temperature": 0.7, "n": args.eval_k, "skip_special_tokens": False})
@@ -428,7 +416,6 @@ def main():
                 }
             }
         except Exception as e:
-            # 强制拦截所有异常并打印，拒绝吞没！
             tqdm.write(f"\n❌ [后台评测严重崩溃] {str(e)}")
             tqdm.write(traceback.format_exc())
             return None
@@ -457,7 +444,6 @@ def main():
     # Phase 2: 外层训练循环
     # ==================================================
     for step in range(args.steps):
-        # 每次进入新的循环，检查后台任务是否顺利完成了
         if eval_future is not None and eval_future.done():
             process_eval_results(eval_future.result())
             eval_future = None
@@ -641,7 +627,6 @@ def main():
             del full_embeds_batch, full_attention_mask, last_hidden
             torch.cuda.empty_cache()
             
-            # [🔥 防卡死黑科技] 每跑完一个 Batch，主动出让一次 GIL，给后台线程留口饭吃！
             time.sleep(0.005)
 
         wandb.log({
@@ -652,9 +637,6 @@ def main():
             "active_samples": len(active_uids)
         })
 
-        # ==================================================
-        # 记录本地训练指标及执行 Early Stop
-        # ==================================================
         next_active_uids = []
         for uid in active_uids:
             global_history[uid]["steps"].append({"step": step, "metrics": step_metrics[uid]})
@@ -665,9 +647,6 @@ def main():
                 next_active_uids.append(uid)
         active_uids = next_active_uids
 
-        # ==================================================
-        # [🚀 触发后台 Eval]
-        # ==================================================
         if step % args.eval_every == 0 and step != args.steps - 1:
             if eval_future is not None:
                 tqdm.write("⏳ 已经到达下一个 Eval 节点，强制主进程等待后台收尾上一轮评测...")
@@ -788,7 +767,6 @@ def main():
             
             opt_raw = optimal_latents[uid]["latent"]
             if opt_raw is None:
-                # 已经是安全的 CPU Tensor 
                 opt_raw = global_latents[uid].detach().clone()
                 
             int8_latent, scale = quantize_to_int8(opt_raw)
@@ -805,315 +783,17 @@ def main():
             }
             saved_dataset.append(item_pack)
             
-        tensor_filename = f"./optimization_histories/optimized_embeds_{run_name}.pt.gz"
+        tensor_filename = f"./optimization_histories/optimized_embeds_{run_name_prefix}_node{args.NODE_RANK}.pt.gz"
         os.makedirs(os.path.dirname(tensor_filename), exist_ok=True)
         with gzip.open(tensor_filename, 'wb') as f:
             torch.save(saved_dataset, f)
             
-        print(f"✅ Embeddings 已成功以 INT8 格式压缩并保存至 {tensor_filename}")
+        print(f"✅ 当前节点 Embeddings 已成功以 INT8 格式压缩并保存至 {tensor_filename}")
+        print("\n" + "="*60)
+        print("🎉 Phase 1-4 寻优结束！请等待所有节点运行完成后，合并 .pt.gz 文件再进行模型蒸馏。")
+        print("="*60)
     except Exception as e:
         print(f"⚠️ 保存 Embeddings 时发生错误: {e}")
-    
-    
-# =========================================================================
-    # Phase 5: 模型蒸馏阶段 (Distillation)
-    # =========================================================================
-    print("\n" + "="*60)
-    print("🔥 Phase 5: 启动模型蒸馏阶段...")
-    print("="*60)
-    
-    wandb.define_metric("model_train_step")
-    wandb.define_metric("distill/train/*", step_metric="model_train_step")
-    wandb.define_metric("distill/eval/*", step_metric="model_train_step")
-    
-    # 5.1 数据集筛选与组装
-    distill_dataset = []
-    for uid in all_uids:
-        acc = optimal_latents[uid]["acc"]
-        if args.distill_sample_filter and acc <= 0:
-            continue # 剔除没有任何提升的样本
-            
-        sd = static_data_cpu[uid]
-        # 获取最新的潜变量（作为优化的 target_think）
-        opt_think_embeds = optimal_latents[uid]["latent"]
-        if opt_think_embeds is None:
-            opt_think_embeds = global_latents[uid].detach().clone()
-        
-        # 组装数据：Question + Think(Target) + EndThink + Connector + Answer(GT)
-        distill_dataset.append({
-            "uid": uid,
-            "ids_q": sd["ids_q"],
-            "embeds_q": sd["embeds_q_cpu"],
-            "target_think_embeds": opt_think_embeds,
-            "ids_think": sd["ids_think"],
-            "ids_gt": sd["ids_gt"], # GT 作为 Answer
-            "gt_text": global_history[uid]['gt_text']
-        })
-        
-    print(f"📦 蒸馏数据集就绪，有效样本数: {len(distill_dataset)} / {len(all_uids)}")
-    
-    if len(distill_dataset) == 0:
-        print("⚠️ 没有符合条件的样本进行蒸馏，流程结束。")
-        return
 
-    # 5.2 预计算 Target Soft Logits
-    print("⚙️ 正在预计算 Target Soft Logits...")
-    target_soft_logits_dict = {}
-    model.eval()
-    with torch.no_grad():
-        for item in tqdm(distill_dataset, desc="Precomputing Target Logits"):
-            uid = item["uid"]
-            emb_q = item["embeds_q"].to(device)
-            emb_think = item["target_think_embeds"].to(device).to(model.dtype)
-            
-            # 拼接输入以计算 original_model 对于优化后 think 的响应
-            # 形式: [Q] [Optimized_Think]
-            full_emb = torch.cat([emb_q, emb_think], dim=1)
-            outputs = model(inputs_embeds=full_emb)
-            
-            # 提取 think 部分的 logits 
-            # (Q 的末尾 token 预测 Think 的第一个 token, 依次类推)
-            start_idx = emb_q.shape[1] - 1
-            end_idx = full_emb.shape[1] - 1
-            think_logits = outputs.logits[:, start_idx:end_idx, :] 
-            
-            # 保存到 CPU 内存防止 GPU OOM
-            target_soft_logits_dict[uid] = think_logits.cpu()
-            
-    torch.cuda.empty_cache()
-
-    # 5.3 准备异步评测环境
-    def pass_at_k(n, c, k):
-        """计算 pass@k"""
-        if n - c < k: return 1.0
-        return 1.0 - math.prod((n - c - i) / (n - i) for i in range(k))
-
-    def load_eval_datasets(dataset_names):
-        datasets_dict = {}
-        for ds_id in dataset_names:
-            try:
-                if "MATH-500" in ds_id:
-                    ds = load_dataset(ds_id, split='test')
-                    q_key, a_key = "problem", "answer"
-                elif "amc23" in ds_id:
-                    ds = load_dataset(ds_id, split='test')
-                    q_key, a_key = "question", "answer"
-                elif "gsm8k" in ds_id:
-                    ds = load_dataset(ds_id, "main", split='test')
-                    q_key, a_key = "question", "answer"
-                elif "aime_2024" in ds_id:
-                    ds = load_dataset(ds_id, split='train')
-                    q_key, a_key = "problem", "answer"
-                elif "aime25" in ds_id:
-                    ds = load_dataset(ds_id, split='test')
-                    q_key, a_key = "problem", "answer"
-                else:
-                    print(f"⚠️ 未知的评测集: {ds_id}，跳过")
-                    continue
-                datasets_dict[ds_id] = {"data": ds, "q_key": q_key, "a_key": a_key}
-                print(f"✅ 成功加载评测集: {ds_id} (样本数: {len(ds)})")
-            except Exception as e:
-                print(f"❌ 加载评测集 {ds_id} 失败: {e}")
-        return datasets_dict
-
-    eval_datasets = load_eval_datasets(args.distill_eval_datasets)
-    distill_eval_future = None
-    distill_step = 0
-    
-    def run_distill_eval_async(step, current_state_dict_path):
-        try:
-            asyncio.set_event_loop(asyncio.new_event_loop())
-            tqdm.write(f"\n🚀 [后台蒸馏评测] 正在同步权重至 vLM...")
-            
-            # 通知 vLLM 从 /dev/shm 热加载最新权重
-            vllm_engine.update_weights(current_state_dict_path)
-            
-            sp_dict = {"max_tokens": 32768, "temperature": 0.7, "n": 32, "skip_special_tokens": False}
-            metrics_to_log = {"model_train_step": step}
-            
-            total_pass1, total_pass8, total_pass16, total_pass32 = [], [], [], []
-            
-            # [🌟 修改点]：给外层数据集评测加上总体进度条
-            for ds_id, ds_info in tqdm(eval_datasets.items(), desc="🌐 蒸馏评测总体进度", leave=False):
-                ds, q_key, a_key = ds_info["data"], ds_info["q_key"], ds_info["a_key"]
-                
-                prompts = []
-                for item in ds:
-                    msg = [{"role": "user", "content": item[q_key]}]
-                    prompts.append(tokenizer.apply_chat_template(msg, tokenize=False, add_generation_prompt=True))
-                
-                tqdm.write(f"   --> vLLM 正在生成 {ds_id} (并发 32)...")
-                batch_outputs = vllm_engine.generate(prompts, sp_dict, input_type="texts")
-                
-                ds_pass1, ds_pass8, ds_pass16, ds_pass32 = 0.0, 0.0, 0.0, 0.0
-                
-                # [🌟 修改点]：给内层指标计算加上进度条 (leave=False 表示跑完自动清理，不干扰主线程)
-                for idx, item in enumerate(tqdm(ds, desc=f"📊 正在校验 {ds_id} 答案", leave=False)):
-                    gt_ans = str(item[a_key]).strip()
-                    correct_count = 0
-                    
-                    for output_ids in batch_outputs[idx]:
-                        gen_text = tokenizer.decode(output_ids, skip_special_tokens=True)
-                        ans_cand = last_boxed_only_string(gen_text)
-                        # 安全校验，防止 NoneType 异常
-                        if ans_cand and is_equiv(remove_boxed(ans_cand), gt_ans):
-                            correct_count += 1
-                            
-                    ds_pass1 += pass_at_k(32, correct_count, 1)
-                    ds_pass8 += pass_at_k(32, correct_count, 8)
-                    ds_pass16 += pass_at_k(32, correct_count, 16)
-                    ds_pass32 += pass_at_k(32, correct_count, 32)
-                
-                num_samples = len(ds)
-                metrics_to_log[f"distill/eval/{ds_id}/pass@1"] = ds_pass1 / num_samples
-                metrics_to_log[f"distill/eval/{ds_id}/pass@8"] = ds_pass8 / num_samples
-                metrics_to_log[f"distill/eval/{ds_id}/pass@16"] = ds_pass16 / num_samples
-                metrics_to_log[f"distill/eval/{ds_id}/pass@32"] = ds_pass32 / num_samples
-                
-                total_pass1.append(ds_pass1 / num_samples)
-                total_pass8.append(ds_pass8 / num_samples)
-                total_pass16.append(ds_pass16 / num_samples)
-                total_pass32.append(ds_pass32 / num_samples)
-
-            if total_pass1:
-                metrics_to_log["distill/eval/avg_pass@1"] = sum(total_pass1)/len(total_pass1)
-                metrics_to_log["distill/eval/avg_pass@8"] = sum(total_pass8)/len(total_pass8)
-                metrics_to_log["distill/eval/avg_pass@16"] = sum(total_pass16)/len(total_pass16)
-                metrics_to_log["distill/eval/avg_pass@32"] = sum(total_pass32)/len(total_pass32)
-                
-            tqdm.write(f"✅ [后台蒸馏评测完成] 均值 Pass@1: {metrics_to_log.get('distill/eval/avg_pass@1', 0):.2%}")
-            return metrics_to_log
-            
-        except Exception as e:
-            tqdm.write(f"\n❌ [蒸馏评测严重崩溃] {str(e)}\n{traceback.format_exc()}")
-            return None
-    
-    # 5.4 开启模型训练状态
-    model.requires_grad_(True)
-    distill_optimizer = torch.optim.AdamW(model.parameters(), lr=args.distill_lr)
-    
-    distill_history_file = f"./optimization_histories/distill_history_{run_name}.jsonl"
-    os.makedirs(os.path.dirname(distill_history_file), exist_ok=True)
-    
-    shm_model_path = "/dev/shm/distill_model_weights.pt"
-    
-    print(f"🏃 开启蒸馏训练，共 {args.distill_epochs} Epochs...")
-    
-    for epoch in range(args.distill_epochs):
-        import random
-        random.shuffle(distill_dataset)
-        
-        batch_size = args.distill_batch_size
-        accum_steps = args.distill_grad_accum_steps
-        
-        mini_batches = [distill_dataset[i:i + batch_size] for i in range(0, len(distill_dataset), batch_size)]
-        pbar = tqdm(mini_batches, desc=f"Distill Epoch {epoch+1}/{args.distill_epochs}")
-        
-        distill_optimizer.zero_grad()
-        
-        for b_idx, batch in enumerate(pbar):
-            batch_loss = 0.0
-            batch_kl = 0.0
-            batch_ce = 0.0
-            
-            # 为了处理不同长度序列，我们依旧拆解 forward 或者利用 attention_mask
-            # 简化实现，这里沿用逐样本处理（可根据显存调整）
-            for item in batch:
-                uid = item["uid"]
-                ids_q = item["ids_q"].to(device)
-                ids_think = item["ids_think"].to(device)
-                ids_gt = item["ids_gt"].to(device)
-                target_logits = target_soft_logits_dict[uid].to(device)
-                
-                # 构建完整的输入序列: Q + Think + EndThink + Conn + GT
-                full_ids = torch.cat([ids_q, ids_think, ids_end_think.to(device), ids_fast_conn.to(device), ids_gt], dim=1)
-                
-                outputs = model(full_ids)
-                logits = outputs.logits
-                
-                # == 计算 KL Loss ==
-                # 定位 think 部分预测的位置
-                think_start = ids_q.shape[1] - 1
-                think_end = think_start + target_logits.shape[1]
-                pred_think_logits = logits[0, think_start:think_end, :]
-                
-                # Soft KL Div
-                log_probs = F.log_softmax(pred_think_logits, dim=-1)
-                target_probs = F.softmax(target_logits[0], dim=-1)
-                kl_loss = F.kl_div(log_probs, target_probs, reduction='batchmean')
-                
-                # == 计算 CE Loss ==
-                # 定位 Answer 预测的位置
-                ans_start = full_ids.shape[1] - ids_gt.shape[1] - 1
-                ans_end = full_ids.shape[1] - 1
-                pred_ans_logits = logits[0, ans_start:ans_end, :]
-                
-                ce_loss = F.cross_entropy(pred_ans_logits, ids_gt[0])
-                
-                total_loss = kl_loss + args.distill_ce_loss_weight * ce_loss
-                
-                # 损失按累积步数缩放
-                (total_loss / (batch_size * accum_steps)).backward()
-                
-                batch_loss += total_loss.item()
-                batch_kl += kl_loss.item()
-                batch_ce += ce_loss.item()
-                
-                # 记录 JSONL (每条样本详情)
-                with open(distill_history_file, "a", encoding="utf-8") as f:
-                    record = {
-                        "model_train_step": distill_step,
-                        "epoch": epoch,
-                        "uid": uid,
-                        "total_loss": total_loss.item(),
-                        "kl_loss": kl_loss.item(),
-                        "ce_loss": ce_loss.item(),
-                        "gen_length": full_ids.shape[1]
-                    }
-                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-            # 梯度累加更新
-            if (b_idx + 1) % accum_steps == 0 or (b_idx + 1) == len(mini_batches):
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                distill_optimizer.step()
-                distill_optimizer.zero_grad()
-                
-                avg_kl = batch_kl / batch_size
-                avg_ce = batch_ce / batch_size
-                avg_loss = batch_loss / batch_size
-                
-                pbar.set_postfix({"Loss": f"{avg_loss:.3f}", "KL": f"{avg_kl:.3f}", "CE": f"{avg_ce:.3f}"})
-                
-                wandb.log({
-                    "model_train_step": distill_step,
-                    "distill/train/total_loss": avg_loss,
-                    "distill/train/kl_loss": avg_kl,
-                    "distill/train/ce_loss": avg_ce,
-                    "distill/train/lr": distill_optimizer.param_groups[0]['lr']
-                })
-                
-                # ======== 触发异步评测 ========
-                if distill_step % args.distill_eval_every == 0:
-                    if distill_eval_future is not None:
-                        tqdm.write("⏳ 等待上一轮蒸馏评测结束...")
-                        res = distill_eval_future.result()
-                        if res: wandb.log(res)
-                        
-                    # 落盘当前模型至共享内存
-                    torch.save(model.state_dict(), shm_model_path)
-                    distill_eval_future = executor.submit(run_distill_eval_async, distill_step, shm_model_path)
-                
-                distill_step += 1
-
-    # 收集最后一轮评测
-    if distill_eval_future is not None:
-        print("\n⏳ 蒸馏训练已全部完成，等待后台收尾最后一轮 Eval...")
-        res = distill_eval_future.result()
-        if res: wandb.log(res)
-
-    print("🎉 蒸馏全流程结束！")
-    wandb.finish()
-    vllm_engine.close()
-    
 if __name__ == "__main__":
     main()
