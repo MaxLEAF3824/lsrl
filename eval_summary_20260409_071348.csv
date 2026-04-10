@@ -1,0 +1,2 @@
+﻿Model,Dataset,Pass@1 (%),Pass@8 (%),Length Mean,Length Variance,Total Questions
+qwen3-1.7b,dapo_math_14k_en_openinstruct,71.20212116587822,88.70746223103922,12558.538245841599,58159281.07033643,6553

@@ -6,7 +6,6 @@ import argparse
 import random
 import glob
 import torch.multiprocessing as mp
-from vllm import LLM, SamplingParams
 from datasets import load_dataset
 
 prompt_template = """You are an expert mathematician. Please solve the following math problem.
@@ -26,12 +25,27 @@ BASE_OUT_DIR = "/workspace/yiqiuguo/lsrl/gen_results"
 # ---------------------------------------------------------
 # 单 GPU 推理逻辑 (微批次追加写入防暴毙)
 # ---------------------------------------------------------
-def run_inference(rank, data_chunk, run_id, model_id, sampling_kwargs):
+def run_inference(rank, data_chunk, run_id, model_id, sampling_kwargs, node_rank):
     if not data_chunk:
         print(f"✨ GPU {rank} 分配到的数据为空 (可能已全部续传完毕)，直接退出。")
         return
 
+    # ================= 核心修复区开始 =================
+    # 1. 绝对优先：在导入任何深度学习库之前，先严格隔离环境！
     os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
+    
+    # 2. 隔离分布式端口：防止 4 个进程抢占默认的 29500 端口导致死锁
+    os.environ["MASTER_PORT"] = str(29500 + rank)
+    
+    # 3. 隔离 vLLM 内部 ZMQ IPC 端口 (针对 v0.6+ 新版多进程引擎)
+    os.environ["VLLM_PORT"] = str(8000 + rank)
+    
+    # 4. (可选) 限制 DataLoader 线程数，防止多进程下 CPU 线程爆炸导致卡顿
+    os.environ["OMP_NUM_THREADS"] = "4"
+
+    # 5. 环境完全干净且隔离后，再进行局部 Import！
+    from vllm import LLM, SamplingParams
+    # ================= 核心修复区结束 =================
     
     llm = LLM(
         model=model_id,
@@ -52,7 +66,7 @@ def run_inference(rank, data_chunk, run_id, model_id, sampling_kwargs):
         formatted_prompts.append(prompt_text)
     
     # temp 文件统一存放到结果目录
-    temp_file = os.path.join(BASE_OUT_DIR, f"temp_{run_id}_gpu_{rank}.jsonl")
+    temp_file = os.path.join(BASE_OUT_DIR, f"temp_{run_id}_node{node_rank}_gpu_{rank}.jsonl")
     
     # 核心：游击战微批次模式
     MICRO_BATCH_SIZE = 50  # 每 50 题落盘一次
@@ -162,7 +176,7 @@ if __name__ == "__main__":
     finished_questions = set()
     
     # 只要是你这个 run_id 的 temp 文件，统统扫一遍
-    temp_pattern = os.path.join(BASE_OUT_DIR, f"temp_{run_id}_gpu_*.jsonl")
+    temp_pattern = os.path.join(BASE_OUT_DIR, f"temp_{run_id}_node{args.NODE_RANK}_gpu_*.jsonl")
     for f_path in glob.glob(temp_pattern):
         with open(f_path, 'r', encoding='utf-8') as f:
             for line in f:
@@ -196,7 +210,7 @@ if __name__ == "__main__":
 
         processes = []
         for i in range(len(chunks)):
-            p = mp.Process(target=run_inference, args=(i, chunks[i], run_id, args.MODEL_ID, sampling_kwargs))
+            p = mp.Process(target=run_inference, args=(i, chunks[i], run_id, args.MODEL_ID, sampling_kwargs, args.NODE_RANK))
             p.start()
             processes.append(p)
 
@@ -232,7 +246,7 @@ if __name__ == "__main__":
                      
         # 其次，读入刚刚跑完的 temp 文件
         for i in range(args.NUM_GPUS):
-            temp_file = os.path.join(BASE_OUT_DIR, f"temp_{run_id}_gpu_{i}.jsonl")
+            temp_file = os.path.join(BASE_OUT_DIR, f"temp_{run_id}_node{args.NODE_RANK}_gpu_{i}.jsonl")
             if os.path.exists(temp_file):
                 with open(temp_file, "r", encoding="utf-8") as infile:
                     for line in infile:
