@@ -87,6 +87,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-1.7B")
     parser.add_argument("--file_path", type=str, default="/workspace/yiqiuguo/lsrl/qwen3-1.7b_math-500_rollout8_len32768_final.jsonl")
+    parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--vllm_gpus", type=int, nargs="+", default=[0, 1, 2, 3])
     parser.add_argument("--big_batch_size", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=1)
@@ -105,7 +106,6 @@ def parse_args():
     # 修改原有的 conn_type 和 reg_type
     parser.add_argument("--conn_type", type=str, default="original", choices=["fast", "original", "on-policy"])
     parser.add_argument("--reg_type", type=str, default="lm", choices=["kl", "lm"])
-    
     # 新增的参数
     parser.add_argument("--adaptive_grad", type=str, default="off", choices=["off", "top_k", "top_p", "soft"])
     parser.add_argument("--adaptive_grad_top_k", type=int, default=128)
@@ -142,7 +142,7 @@ def main():
     torch.cuda.set_device(device)
 
     if rank == 0:
-        wandb.init(project="L-GRPO-Math500", config=vars(args))
+        wandb.init(project="L-GRPO-Math500", name=args.run_name, config=vars(args))
         wandb.define_metric("global_step")
         wandb.define_metric("train/*", step_metric="global_step")
         wandb.define_metric("eval/*", step_metric="global_step")
@@ -161,7 +161,7 @@ def main():
             tensor_parallel_size=1,
             data_parallel_size=world_size,
             distributed_executor_backend="external_launcher",
-            gpu_memory_utilization=0.2,
+            gpu_memory_utilization=0.1,
             dtype="bfloat16",
             enable_prompt_embeds=True,
             max_model_len=40960,
@@ -197,7 +197,7 @@ def main():
     # 每个 Rank 维护自己的局部数据 local_history
     local_history = {d["uid"]: {"uid": d["uid"], "problem": d["question_text"], "gt_text": d["gt_text"], "steps": []} for d in my_raw_data}
     local_distill_dataset = []
-    global_early_stopped_uids = set()
+    
 
     embeds_end_think_cpu = embeds_end_think.cpu()
     embeds_fast_conn_cpu = embeds_fast_conn.cpu()
@@ -410,6 +410,8 @@ def main():
                     step_record["metrics"].update(eval_metrics[uid])
                     break
 
+    global_early_stopped_uids = set()
+
     # =========================================================================
     # [🔥 外层大循环] Big Batch 迭代控制内存占用
     # =========================================================================
@@ -557,21 +559,51 @@ def main():
                     embeds_q_list, embeds_conn_list, embeds_gt_list, embeds_pred_list = [], [], [], []
                     ids_q_list, ids_think_list, ids_conn_list, ids_gt_list, ids_pred_list = [], [], [], [], []
 
-                    # 确定当前 batch 最大的 connector 数量
+                    # 1. 准备当前 batch 的基础数据 (千万不能删)
+                    for uid in batch_uids:
+                        sd = static_data_cpu[uid]
+                        curr_mask_list.append(sd["grad_mask"].to(device))
+                        p = global_latents[uid]
+                        p.data = p.data.to(device)
+                        if p.grad is not None:
+                            p.grad.data = p.grad.data.to(device)
+                        curr_think_list.append(p)
+
+                        if args.optimizer == "adam":
+                            opt = global_opts[uid]
+                            move_optimizer_state(opt, device)
+                            for pg in opt.param_groups:
+                                pg["lr"] = current_lr
+                        elif args.optimizer == "frank_wolfe" and p.grad is not None:
+                            p.grad.zero_()
+
+                        with torch.no_grad():
+                            embeds_q_list.append(model.get_input_embeddings()(sd["ids_q"].to(device)))
+                            embeds_conn_list.append(model.get_input_embeddings()(sd["ids_conn"].to(device)))
+                            embeds_gt_list.append(model.get_input_embeddings()(sd["ids_gt"].to(device)))
+                            embeds_pred_list.append(model.get_input_embeddings()(sd["ids_pred"].to(device)))
+
+                        ids_q_list.append(sd["ids_q"].to(device))
+                        ids_think_list.append(sd["ids_think"].to(device))
+                        ids_conn_list.append(sd["ids_conn"].to(device))
+                        ids_gt_list.append(sd["ids_gt"].to(device))
+                        ids_pred_list.append(sd["ids_pred"].to(device))
+
+                    # 2. 确定当前 batch 最大的 connector 数量
                     max_conns = 1
                     if args.conn_type == "on-policy":
                         max_conns = max([len(static_data_cpu[uid].get("active_conns", [(None, None)])) for uid in batch_uids])
 
                     batch_size_cur = len(batch_uids)
                     
-                    # 循环处理每一个 Connector (时间换空间，避免 OOM)
+                    # 3. 循环处理每一个 Connector (时间换空间，避免 OOM)
                     for c_idx in range(max_conns):
                         full_embeds_list = []
                         valid_indices = []
                         
                         for i, uid in enumerate(batch_uids):
                             sd = static_data_cpu[uid]
-                            conns = sd.get("active_conns", [(sd["embeds_conn_cpu"], sd["ids_conn_cpu"])])
+                            conns = sd.get("active_conns", [(sd["embeds_conn_cpu"], sd["ids_conn"])])
                             if c_idx < len(conns):
                                 emb_conn, _ = conns[c_idx]
                                 target_emb = embeds_gt_list[i] if args.grad_direction == "positive" else embeds_pred_list[i]
@@ -597,13 +629,19 @@ def main():
                         full_embeds_batch = torch.cat(full_embeds_list, dim=0)
                         full_attention_mask = torch.cat(attention_mask_list, dim=0)
 
-                        last_hidden = model.model(inputs_embeds=full_embeds_batch, attention_mask=full_attention_mask).last_hidden_state
-                        last_hidden_detached = last_hidden.detach().requires_grad_(True)
+                        if step == 0:
+                            # Step 0 不反向传播，绝对不能建图，否则几十G激活值卡在显存里
+                            with torch.no_grad():
+                                last_hidden = model.model(inputs_embeds=full_embeds_batch, attention_mask=full_attention_mask).last_hidden_state
+                            last_hidden_detached = last_hidden.detach() # 不需要 requires_grad
+                        else:
+                            last_hidden = model.model(inputs_embeds=full_embeds_batch, attention_mask=full_attention_mask).last_hidden_state
+                            last_hidden_detached = last_hidden.detach().requires_grad_(True)
 
                         for local_idx, i in enumerate(valid_indices):
                             uid = batch_uids[i]
                             sd = static_data_cpu[uid]
-                            conns = sd.get("active_conns", [(sd["embeds_conn_cpu"], sd["ids_conn_cpu"])])
+                            conns = sd.get("active_conns", [(sd["embeds_conn_cpu"], sd["ids_conn"])])
                             _, id_conn = conns[c_idx]
                             id_conn = id_conn.to(device)
                             num_conns = len(conns)
@@ -622,14 +660,33 @@ def main():
                             lm_loss_hard_val = 0.0
 
                             if args.reg_type == "kl":
-                                # (保留你原有的 KL Loss Chunk 计算逻辑，累加到 reg_loss_val，注意除以 num_conns)
-                                pass # 这里为了简洁省略，直接用你原来的 KL 代码即可
+                                kl_sum_val = 0.0
+                                orig_probs_topk, orig_indices_topk = sd["topk_probs"].to(device), sd["topk_indices"].to(device)
+                                for c_start in range(0, think_len, args.chunk_size):
+                                    c_end = min(c_start + args.chunk_size, think_len)
+                                    h_chunk = last_hidden_detached[[local_idx], think_start + c_start : think_start + c_end, :]
+                                    logits_chunk = model.lm_head(h_chunk)
+                                    lse_chunk = torch.logsumexp(logits_chunk, dim=-1, keepdim=True)
+
+                                    orig_p_chunk = orig_probs_topk[:, c_start:c_end, :]
+                                    orig_idx_chunk = orig_indices_topk[:, c_start:c_end, :]
+                                    curr_log_probs_topk_chunk = torch.gather(logits_chunk, -1, orig_idx_chunk) - lse_chunk
+                                    kl_chunk = (orig_p_chunk * (torch.log(orig_p_chunk + 1e-10) - curr_log_probs_topk_chunk)).sum(dim=-1)
+                                    kl_sum_val += kl_chunk.sum()
+                                reg_loss_val = kl_sum_val / think_len
                             
                             elif args.reg_type == "lm":
-                                # --- 新版 LM Loss 逻辑 ---
-                                curr_think_norm = F.normalize(curr_think_list[i], p=2, dim=-1)
-                                sim = torch.matmul(curr_think_norm, all_embeddings.T.to(device))
-                                curr_think_hard_ids = torch.argmax(sim, dim=-1) # [1, think_len]
+                                # --- 新版 LM Loss 逻辑 (Chunked 防 OOM 版) ---
+                                with torch.no_grad():
+                                    curr_think_hard_ids = torch.empty((1, think_len), dtype=torch.long, device=device)
+                                    curr_think_norm = F.normalize(curr_think_list[i], p=2, dim=-1)
+                                    
+                                    # 1. 分块计算 argmax，防止 sim 矩阵撑爆显存
+                                    for c_start in range(0, think_len, args.chunk_size):
+                                        c_end = min(c_start + args.chunk_size, think_len)
+                                        chunk_norm = curr_think_norm[:, c_start:c_end, :]
+                                        sim_chunk = torch.matmul(chunk_norm, all_embeddings.T.to(device))
+                                        curr_think_hard_ids[:, c_start:c_end] = torch.argmax(sim_chunk, dim=-1)
                                 
                                 # A. 可导的 LM Loss (Chunked 节省显存)
                                 lm_loss_sum = 0.0
@@ -639,18 +696,52 @@ def main():
                                     logits_chunk = model.lm_head(h_chunk)
                                     labels_chunk = curr_think_hard_ids[:, c_start + 1 : c_end + 1]
                                     loss_chunk = F.cross_entropy(logits_chunk.reshape(-1, logits_chunk.size(-1)), labels_chunk.reshape(-1), reduction='sum')
-                                    lm_loss_sum += loss_chunk
-                                reg_loss_val = lm_loss_sum / (think_len - 1)
+                                    lm_loss_sum = lm_loss_sum + loss_chunk
+                                reg_loss_val = lm_loss_sum / max(1, think_len - 1)
 
-                                # B. 不可导的 LM Loss Hard (仅用于观察，只在 c_idx==0 时算一次)
-                                if c_idx == 0 and step % 5 == 0: # 没必要每步都算，省点时间
+                                # B. 不可导的 LM Loss Hard (利用 KV Cache 滚动计算，彻底杜绝 OOM)
+                                if c_idx == 0 and step % 5 == 0:
                                     with torch.no_grad():
                                         hard_embeds = model.get_input_embeddings()(curr_think_hard_ids)
-                                        hard_full_emb = torch.cat([embeds_q_list[i], hard_embeds], dim=1)
-                                        hard_logits = model(inputs_embeds=hard_full_emb).logits
-                                        hard_think_logits = hard_logits[:, ids_q_list[i].shape[1]-1 : ids_q_list[i].shape[1]-1 + think_len - 1, :]
-                                        lm_loss_hard_val = F.cross_entropy(hard_think_logits.reshape(-1, hard_think_logits.size(-1)), curr_think_hard_ids[:, 1:].reshape(-1)).item()
-                                        step_metrics[uid]["lm_loss_hard"] = lm_loss_hard_val
+                                        
+                                        # 第一步：Prefill Q，获取初始 KV Cache
+                                        outputs = model(inputs_embeds=embeds_q_list[i], use_cache=True)
+                                        past_key_values = outputs.past_key_values
+                                        
+                                        # Q 的最后一个 Token 预测 Think 的第一个 Token
+                                        last_q_logit = outputs.logits[:, -1:, :]
+                                        lm_loss_hard_sum = F.cross_entropy(
+                                            last_q_logit.reshape(-1, last_q_logit.size(-1)), 
+                                            curr_think_hard_ids[:, 0:1].reshape(-1), 
+                                            reduction='sum'
+                                        ).item()
+                                        
+                                        # 第二步：带着 KV Cache，分块 Decode Think
+                                        for c_start in range(0, think_len - 1, args.chunk_size):
+                                            c_end = min(c_start + args.chunk_size, think_len - 1)
+                                            chunk_embeds = hard_embeds[:, c_start:c_end, :]
+                                            
+                                            outputs = model(
+                                                inputs_embeds=chunk_embeds,
+                                                past_key_values=past_key_values,
+                                                use_cache=True
+                                            )
+                                            past_key_values = outputs.past_key_values
+                                            logits_chunk = outputs.logits
+                                            
+                                            labels_chunk = curr_think_hard_ids[:, c_start + 1 : c_end + 1]
+                                            loss_chunk = F.cross_entropy(
+                                                logits_chunk.reshape(-1, logits_chunk.size(-1)), 
+                                                labels_chunk.reshape(-1), 
+                                                reduction='sum'
+                                            )
+                                            lm_loss_hard_sum += loss_chunk.item()
+                                            
+                                        step_metrics[uid]["lm_loss_hard"] = lm_loss_hard_sum / max(1, think_len)
+                                        
+                                        # 显式释放 KV Cache
+                                        del outputs, past_key_values, hard_embeds
+                                        torch.cuda.empty_cache()
 
                             # 3. 组合 Loss 并 Backward
                             s_gt = gt_loss / num_conns
@@ -672,7 +763,11 @@ def main():
 
                         if step > 0:
                             last_hidden.backward(last_hidden_detached.grad)
+                        
+                        # === 最后一道保险：清理当前 Connector 的大变量 ===
+                        del last_hidden, last_hidden_detached, full_embeds_batch, full_attention_mask
 
+                    # 4. 优化器更新与 History 记录
                     for i, uid in enumerate(batch_uids):
                         p, mask = curr_think_list[i], curr_mask_list[i]
                         fw_ids, fw_weights = None, None
@@ -695,7 +790,7 @@ def main():
                             step_metrics[uid]["fw_action_ids"] = fw_ids.cpu().tolist()
                             step_metrics[uid]["fw_action_weights"] = fw_weights.cpu().tolist()
 
-                # 更新 active_uids 时，剔除 Early Stop 的样本
+                # 5. 更新 active_uids 时，剔除 Early Stop 的样本
                 next_active_uids = []
                 for uid in active_uids:
                     local_history[uid]["steps"].append({"step": global_step_id, "metrics": step_metrics[uid]})
