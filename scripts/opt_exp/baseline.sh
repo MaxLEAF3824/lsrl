@@ -12,7 +12,7 @@ DATA_FILE="/workspace/yiqiuguo/lsrl/gen_results/qwen3-1.7b_math-500_rollout8_run
 
 echo "🚀 开始启动Latent Optimization & Distillation 训练..."
 cd /workspace/yiqiuguo/lsrl/
-torchrun --nproc_per_node=4 /workspace/yiqiuguo/lsrl/latent_optimizer_v6.py \
+torchrun --nproc_per_node=4 /workspace/yiqiuguo/lsrl/latent_optimizer_v7.py \
     --model_name "$MODEL" \
     --file_path "$DATA_FILE" \
     --vllm_gpus 0 1 2 3 \
@@ -40,5 +40,5 @@ torchrun --nproc_per_node=4 /workspace/yiqiuguo/lsrl/latent_optimizer_v6.py \
     --distill_eval_every 500 \
     --distill_batch_size 1 \
     --distill_grad_accum_steps 4 \
-    --distill_eval_datasets HuggingFaceH4/MATH-500 math-ai/aime25 math-ai/amc23 HuggingFaceH4/aime_2024
+    --distill_eval_datasets HuggingFaceH4/MATH-500
 # openai/gsm8k 
