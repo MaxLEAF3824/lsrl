@@ -1,15 +1,19 @@
-import multiprocessing as mp
 import math
 import traceback
 import signal
 import torch
 import os
+import atexit
+
+# 🚀 [核心修改 1] 将标准的 multiprocessing 替换为 torch 深度定制的版本
+# 这允许我们在跨进程传递 Queue 时，自动使用共享内存传递 Tensor 指针，而非序列化数据
+import torch.multiprocessing as mp
 
 def vllm_worker_loop(gpu_id, model_name, task_queue, result_queue):
     """运行在独立子进程中的 vLLM Worker"""
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     
-    # [🔥 修复点 1] 强行禁用 V1 引擎的多进程隔离，确保向后兼容性
+    # 强行禁用 V1 引擎的多进程隔离，确保向后兼容性
     os.environ["VLLM_USE_V1"] = "0"
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     
@@ -23,8 +27,8 @@ def vllm_worker_loop(gpu_id, model_name, task_queue, result_queue):
             model=model_name, 
             trust_remote_code=True, 
             tensor_parallel_size=1, 
-            gpu_memory_utilization=0.9, 
-            dtype="float16",
+            gpu_memory_utilization=0.4, 
+            dtype="bfloat16",
             enable_prompt_embeds=True,
             max_model_len=40960
         )
@@ -44,7 +48,9 @@ def vllm_worker_loop(gpu_id, model_name, task_queue, result_queue):
                 sp = SamplingParams(**sp_dict)
                 
                 if 'embeds_list' in task and task['embeds_list']:
-                    inputs = [{"prompt_embeds": torch.tensor(emb, dtype=torch.float16)} for emb in task['embeds_list']]
+                    # 🚀 [核心修改 2] 拿到的直接是共享内存中的 PyTorch Tensor，零反序列化开销
+                    # vLLM 会在内部自动将这些 CPU Tensor 搬运到当前 GPU
+                    inputs = [{"prompt_embeds": emb} for emb in task['embeds_list']]
                 elif 'prompts_list' in task and task['prompts_list']:
                     inputs = task['prompts_list'] 
                 else:
@@ -61,14 +67,15 @@ def vllm_worker_loop(gpu_id, model_name, task_queue, result_queue):
                     
                 result_queue.put(('GENERATE_DONE', task_idx, batch_res))
                 
+                # 手动清理引用，加速底层共享内存的回收
+                del inputs, outputs
+                
             # =============== 处理权重更新请求 ===============
             elif task_type == 'UPDATE_WEIGHTS':
                 payload = task['payload']
                 print(f"🔄 [Worker GPU {gpu_id}] 开始热更新权重...")
                 
-                # [🔥 修复点 2] 兼容 vLLM 0.8.x+ 的 RPC 架构
                 if hasattr(llm, 'collective_rpc'):
-                    # 新版 vLLM 推荐使用 RPC 向底层 Worker 下发函数
                     def worker_load_weights(worker):
                         import torch
                         if isinstance(payload, str):
@@ -80,14 +87,11 @@ def vllm_worker_loop(gpu_id, model_name, task_queue, result_queue):
                         else:
                             state_dict = payload
                         
-                        # 此时运行在底层 worker 环境中，直接拿到 model 赋值
                         worker.model_runner.model.load_weights(state_dict.items())
                         del state_dict
                         torch.cuda.empty_cache()
                     
                     llm.collective_rpc(worker_load_weights)
-                
-                # 旧版 vLLM 兼容逻辑
                 else:
                     if isinstance(payload, str):
                         if payload.endswith('.safetensors'):
@@ -98,7 +102,6 @@ def vllm_worker_loop(gpu_id, model_name, task_queue, result_queue):
                     else:
                         hf_state_dict = payload
                     
-                    # 因为前面注入了环境变量，这里保证能取到 model_executor
                     executor = llm.llm_engine.model_executor
                     if hasattr(executor, 'driver_worker'):
                         model = executor.driver_worker.model_runner.model
@@ -120,7 +123,23 @@ def vllm_worker_loop(gpu_id, model_name, task_queue, result_queue):
         error_msg = traceback.format_exc()
         print(f"\n❌ [Worker GPU {gpu_id}] 发生错误:\n{error_msg}\n")
         result_queue.put(('ERROR', gpu_id, error_msg))
-
+    finally:
+        # 🚀 [核心修复] 在进程退出前，优雅清理 PyTorch 环境
+        print(f"🛑 [Worker GPU {gpu_id}] 正在清理底层分布式环境...")
+        
+        # 1. 显式删除 LLM 对象，帮助垃圾回收
+        if 'llm' in locals():
+            del llm 
+            
+        # 2. 显式销毁 PyTorch 分布式进程组，消除 NCCL 警告
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+            
+        # 3. 清空当前 Worker 的 CUDA 缓存
+        import torch
+        torch.cuda.empty_cache()
+        print(f"✅ [Worker GPU {gpu_id}] 环境清理完毕，安全退出。")
 
 class VLLMDPWorkerPool:
     def __init__(self, model_name, gpu_ids=[1, 2, 3]):
@@ -133,7 +152,8 @@ class VLLMDPWorkerPool:
         self.task_queue = mp.Queue()
         self.result_queue = mp.Queue()
         self.workers = []
-        
+        self._is_closed = False 
+
         for gpu_id in gpu_ids:
             p = mp.Process(
                 target=vllm_worker_loop, 
@@ -142,6 +162,8 @@ class VLLMDPWorkerPool:
             p.start()
             self.workers.append(p)
             
+        atexit.register(self.close)
+    
     def clear_queues(self):
         while not self.task_queue.empty():
             try: self.task_queue.get_nowait()
@@ -166,8 +188,14 @@ class VLLMDPWorkerPool:
                     'task_idx': idx,
                     'sp_dict': sampling_params_dict
                 }
+                
                 if input_type == "embeds":
-                    task_dict['embeds_list'] = [emb.detach().cpu().to(torch.float16).numpy() for emb in chunk]
+                    shared_embeds = []
+                    for emb in chunk:
+                        # 兜底：防止主代码误传了 numpy 进来
+                        t = emb if isinstance(emb, torch.Tensor) else torch.tensor(emb)
+                        shared_embeds.append(t.share_memory_())
+                    task_dict['embeds_list'] = shared_embeds
                 else:
                     task_dict['prompts_list'] = chunk
                     
@@ -205,7 +233,23 @@ class VLLMDPWorkerPool:
         print(f"🌟 成功热更新了 {success_count} 个 Worker 的权重。")
 
     def close(self):
-        for _ in self.workers:
-            self.task_queue.put(None)
-        for p in self.workers:
-            p.join()
+        """安全关闭所有 Worker 进程"""
+        if getattr(self, '_is_closed', True): 
+            return
+            
+        self._is_closed = True
+        print("\n🧹 接收到停止信号，正在安全关闭 vLLM Worker 进程并释放显存...")
+        
+        try:
+            for _ in self.workers:
+                self.task_queue.put(None)
+                
+            for p in self.workers:
+                p.join(timeout=5)  
+                if p.is_alive():
+                    print(f"⚠️ Worker 进程 (PID: {p.pid}) 未响应，强制终止...")
+                    p.terminate()
+            
+            print("✅ vLLM Worker 进程已全部安全清理完毕。")
+        except Exception as e:
+            print(f"⚠️ 清理 Worker 时发生异常: {e}")

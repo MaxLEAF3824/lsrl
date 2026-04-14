@@ -1,5 +1,7 @@
 wandb/*
 gen_results/*
+results/*
+checkpoints/*
 optimization_histories/*
 gen_results_with_system_prompt/*
 __pycache__/*

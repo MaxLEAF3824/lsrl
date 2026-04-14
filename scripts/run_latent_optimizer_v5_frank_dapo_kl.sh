@@ -1,16 +1,14 @@
 #!/bin/bash
 
 # ==========================================================
-# 潜在空间重推理优化 - V2 高吞吐批处理架构 + 异步蒸馏框架
+# 潜在空间重推理优化 - V5 高吞吐批处理架构 + 异步蒸馏框架
 # ==========================================================
 
 export CUDA_VISIBLE_DEVICES="0,1,2,3"
 
 MODEL="Qwen/Qwen3-1.7B"
-DATA_FILE="/workspace/yiqiuguo/lsrl/gen_results/qwen3-1.7b_dapo_math_14k_en_openinstruct_rollout8_run20260409_n098_node0256.jsonl"
+DATA_FILE="/workspace/yiqiuguo/lsrl/gen_results/qwen3-1.7b_dapo_math_14k_en_openinstruct_rollout8_run20260408_221824_ff22.jsonl"
 
-BATCH_SIZE=1
-CHUNK_SIZE=1024 
 
 echo "🚀 开始启动Latent Optimization & Distillation 训练..."
 cd /workspace/yiqiuguo/lsrl/
@@ -18,8 +16,9 @@ python /workspace/yiqiuguo/lsrl/latent_optimizer_v5.py \
     --model_name "$MODEL" \
     --file_path "$DATA_FILE" \
     --vllm_gpus 1 2 3 \
-    --batch_size $BATCH_SIZE \
-    --chunk_size $CHUNK_SIZE \
+    --big_batch_size 512 \
+    --batch_size 1 \
+    --chunk_size 2048 \
     --optimizer "frank_wolfe" \
     --learning_rate 2e-3 \
     --fw_gamma 0.1 \
@@ -34,12 +33,12 @@ python /workspace/yiqiuguo/lsrl/latent_optimizer_v5.py \
     --reg_type "lm" \
     --early_stop \
     --early_stop_threshold 5e-4 \
+    --max_samples 
     --distill_epochs 3 \
     --distill_lr 2e-5 \
     --distill_ce_loss_weight 0.0 \
     --distill_eval_every 500 \
     --distill_batch_size 1 \
     --distill_grad_accum_steps 4 \
-    --distill_sample_filter \
     --distill_eval_datasets HuggingFaceH4/MATH-500 math-ai/aime25 math-ai/amc23 HuggingFaceH4/aime_2024
 # openai/gsm8k 
