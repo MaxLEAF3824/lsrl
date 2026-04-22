@@ -15,6 +15,7 @@ cd /workspace/yiqiuguo/lsrl/
 torchrun --nproc_per_node=4 /workspace/yiqiuguo/lsrl/latent_optimizer_v7.py \
     --model_name "$MODEL" \
     --file_path "$DATA_FILE" \
+    --run_name latopt-exp-$(basename "$0" .sh) \
     --vllm_gpus 0 1 2 3 \
     --big_batch_size 512 \
     --batch_size 1 \

@@ -4,20 +4,22 @@
 # 0. 接收并解析命令行参数
 # ==========================================
 # 设置默认值，防止没传参数时报错
-RUN_SEED=89
+RUN_SEED=26418
 NODE_TOTAL=1
 NODE_RANK=0
 export WANDB_API_KEY=469ecac017511ec7e2e95fc2f1bab23668dfc776
+
 # 解析外部传入的参数
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         --RUN_SEED) RUN_SEED="$2"; shift ;;
-        --NODE_TOTAL) NODE_TOTAL="$2"; shift ;;
-        --NODE_RANK) NODE_RANK="$2"; shift ;;
+        --NODE_TOTAL|--NT|-NT) NODE_TOTAL="$2"; shift ;;
+        --NODE_RANK|--NR|-NR) NODE_RANK="$2"; shift ;;
         *) echo "❌ 报错: 遇到未知参数 $1"; exit 1 ;;
     esac
     shift
 done
+
 
 # ==========================================
 # 批量大模型离线数学推理评测脚本
@@ -26,28 +28,33 @@ done
 # 1. 定义要评测的模型列表
 MODELS=(
     # "Qwen/Qwen3-0.6B"
-    # "Qwen/Qwen3-1.7B"
+    "Qwen/Qwen3-1.7B"
     # "Qwen/Qwen2.5-1.5B-Instruct"
     # "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
     # "/workspace/yiqiuguo/lsrl/checkpoints/radiant-bee-213/step474"
-    "/workspace/yiqiuguo/lsrl/checkpoints/gallant-firebrand-212/step688"
+    # "/workspace/yiqiuguo/lsrl/checkpoints/gallant-firebrand-212/step688"
+    # "/workspace/yiqiuguo/verl/checkpoints/verl_grpo_math_gb200/qwen3_1.7b_math_gb200/global_step_150/actor_hf_step_150"
+    # "/workspace/yiqiuguo/lsrl/checkpoints/light-planet-301/step477"
+    # "Qwen/Qwen3-1.7B-Base"
+    # "/workspace/yiqiuguo/verl/checkpoints/verl_grpo_math_gb200/qwen3_1.7b_math_gb200/global_step_550/actor_hf_step_550"
+    # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-step0-base/step153"
 )
 
 # 2. 定义要评测的数据集列表
 DATASETS=(
+    "mnoukhov/dapo_math_14k_en_openinstruct"
     # "HuggingFaceH4/MATH-500"
     # "KbsdJames/Omni-MATH"
-    "math-ai/aime25"
-    "HuggingFaceH4/aime_2024"
-    "math-ai/amc23"
-    # "mnoukhov/dapo_math_14k_en_openinstruct"
+    # "math-ai/aime25"
+    # "HuggingFaceH4/aime_2024"
+    # "math-ai/amc23"
 )
 
 # 3. 固定的采样和硬件参数
 NUM_GPUS=4
 N=32
 TEMP=1.0
-MAX_TOKENS=32768
+MAX_TOKENS=8192
 TOP_P=0.95
 
 cd /workspace/yiqiuguo/lsrl
@@ -94,5 +101,4 @@ for MODEL in "${MODELS[@]}"; do
     done
 done
 
-echo ""
 echo "🎉 所有评测任务已全部执行完毕！"

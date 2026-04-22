@@ -33,7 +33,7 @@ python /workspace/yiqiuguo/lsrl/latent_optimizer_v5.py \
     --reg_type "lm" \
     --early_stop \
     --early_stop_threshold 5e-4 \
-    --max_samples 
+    --max_samples 1000 \
     --distill_epochs 3 \
     --distill_lr 2e-5 \
     --distill_ce_loss_weight 0.0 \

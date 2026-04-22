@@ -8,16 +8,6 @@ import glob
 import torch.multiprocessing as mp
 from datasets import load_dataset
 
-prompt_template = """You are an expert mathematician. Please solve the following math problem.
-
-You must strictly adhere to the following output format:
-1. First, write out your detailed, step-by-step reasoning process. You MUST enclose your entire reasoning process within `<think>` and `</think>` tags.
-2. Provide your final mathematical answer enclosed within `\\boxed{{}}`. 
-
-Problem:
-{question}
-
-"""
 
 # 统一输出目录，方便集中管理和扫描
 BASE_OUT_DIR = "/workspace/yiqiuguo/lsrl/gen_results"
@@ -75,8 +65,8 @@ def run_inference(rank, data_chunk, run_id, model_id, sampling_kwargs, node_rank
     for item in data_chunk:
         question_text = item.get('q', None)
         messages = [{"role": "user", "content": question_text}]
-        prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        prompt_text += "<think>"
+        prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,enable_thinking=False)
+        # prompt_text += "<think>"
         formatted_prompts.append(prompt_text)
     
     # temp 文件统一存放到结果目录
@@ -118,6 +108,7 @@ if __name__ == "__main__":
     parser.add_argument("--DATASET_ID", type=str, default="HuggingFaceH4/MATH-500", help="Dataset ID")
     parser.add_argument("--NUM_GPUS", type=int, default=4, help="Number of GPUs to use for DP inference")
     
+    parser.add_argument("--NO_THINK", type=int, default=8, help="Number of rollouts")
     parser.add_argument("--SAMPLING_PARAMS_n", type=int, default=8, help="Number of rollouts")
     parser.add_argument("--SAMPLING_PARAMS_temperature", type=float, default=1.0)
     parser.add_argument("--SAMPLING_PARAMS_max_tokens", type=int, default=32768)

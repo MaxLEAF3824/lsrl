@@ -1,0 +1,3 @@
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+bash /workspace/yiqiuguo/lsrl/scripts/v5_scripts/run_latent_optimizer_v5_frank_dapo_kl_qwen_base.sh
+bash /workspace/yiqiuguo/lsrl/scripts/v5_scripts/run_latent_optimizer_v5_frank_dapo_klce_qwen_base.sh
