@@ -23,14 +23,14 @@ torchrun --nproc_per_node=4 /workspace/yiqiuguo/lsrl/latent_optimizer_v7.py \
     --learning_rate 2e-3 \
     --fw_gamma 0.1 \
     --steps 50 \
-    --kl_weight 1.0 \
+    --kl_weight 0.0 \
     --eval_every 5 \
     --eval_k 8 \
     --eval_modes pure fast \
     --mask_strategy "first_k" \
     --mask_max_k 32000 \
-    --grad_direction "positive" \
-    --conn_type "fast" \
+    --grad_direction "contrastive" \
+    --conn_type "original" \
     --reg_type "lm" \
     --max_samples 4000 \
     --early_stop \

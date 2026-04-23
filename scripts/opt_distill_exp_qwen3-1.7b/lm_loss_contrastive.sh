@@ -32,7 +32,7 @@ torchrun --nproc_per_node=4 /workspace/yiqiuguo/lsrl/latent_optimizer_v7.py \
     --grad_direction "contrastive" \
     --conn_type "original" \
     --reg_type "lm" \
-    --max_samples 200 \
+    --max_samples 4000 \
     --early_stop \
     --early_stop_threshold 5e-4 \
     --distill_epochs 3 \

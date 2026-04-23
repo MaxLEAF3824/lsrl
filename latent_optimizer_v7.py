@@ -130,7 +130,6 @@ def main():
 
     embeds_fast_conn, ids_fast_conn = get_embeds("\nTherefore, the final answer is \n$$\n\\boxed{")
     all_embeddings = model.get_input_embeddings().weight.detach()
-    scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
 
     if rank == 0:
         print(f"📄 读取文件: {args.file_path}")
@@ -607,7 +606,7 @@ def main():
                                 last_hidden_detached_neg = last_hidden_neg.detach().requires_grad_(True)
 
 
-                        # ========== 3. 损失计算和反传整合 ==========
+                        # ========== 3. 损失计算和反传整合 (极限显存优化版) ==========
                         for i, uid in enumerate(batch_uids):
                             if i not in valid_indices_pos: continue
                             local_idx_pos = valid_indices_pos.index(i)
@@ -616,7 +615,7 @@ def main():
                             conns = sd.get("active_conns", [(sd["embeds_conn_cpu"], sd["ids_conn"])])
                             num_conns = len(conns)
 
-                            # --- [3.1] GT 损失 ---
+                            # --- [3.1] GT 损失 (针对短文本: 不分Chunk，算完立刻反传释放) ---
                             if args.grad_direction == "contrastive":
                                 id_conn_pos = ids_fast_conn.to(device)
                                 target_ids_pos = ids_gt_list[i]
@@ -627,17 +626,33 @@ def main():
 
                             gt_pos = ids_q_list[i].shape[1] + ids_think_list[i].shape[1] + id_conn_pos.shape[1] - 1
                             target_logits_pos = model.lm_head(last_hidden_detached_pos[[local_idx_pos], gt_pos : gt_pos + target_ids_pos.shape[1], :])
-                            gt_loss = F.cross_entropy(target_logits_pos.view(-1, target_logits_pos.size(-1)), target_ids_pos.view(-1))
-                            if args.grad_direction == "negative": gt_loss = -gt_loss
+                            
+                            # GT 原本是 mean，等价于 sum / target_len
+                            gt_loss_raw = F.cross_entropy(target_logits_pos.view(-1, target_logits_pos.size(-1)), target_ids_pos.view(-1))
+                            
+                            # 提前算好该分支的梯度缩放因子
+                            gt_scale_factor = 1.0 / (num_conns * batch_size_cur)
+                            if args.grad_direction == "negative": 
+                                gt_scale_factor = -gt_scale_factor
 
-                            # --- [3.2] 正则损失 (使用 Pos 的隐状态，因为 q+think 是共享的) ---
+                            # 【核心优化】算完几十个 Token 的图，立刻累加梯度并销毁！
+                            if step > 0:
+                                (gt_loss_raw * gt_scale_factor).backward()
+                                
+                            s_gt_val = gt_loss_raw.item() / num_conns
+
+
+                            # --- [3.2] 正则损失 (处理 20K-30K 的思考过程: 严格 Chunk-wise Backward) ---
                             think_start = ids_q_list[i].shape[1] - 1
                             think_len = ids_think_list[i].shape[1]
                             reg_loss_val = 0.0
 
                             if args.reg_type == "kl":
                                 kl_sum_val = 0.0
+                                # KL 缩放因子 (sum -> mean 的缩放)
+                                kl_scale_factor = args.kl_weight / (think_len * num_conns * batch_size_cur)
                                 orig_probs_topk, orig_indices_topk = sd["topk_probs"].to(device), sd["topk_indices"].to(device)
+                                
                                 for c_start in range(0, think_len, args.chunk_size):
                                     c_end = min(c_start + args.chunk_size, think_len)
                                     h_chunk = last_hidden_detached_pos[[local_idx_pos], think_start + c_start : think_start + c_end, :]
@@ -647,10 +662,18 @@ def main():
                                     orig_p_chunk = orig_probs_topk[:, c_start:c_end, :]
                                     orig_idx_chunk = orig_indices_topk[:, c_start:c_end, :]
                                     curr_log_probs_topk_chunk = torch.gather(logits_chunk, -1, orig_idx_chunk) - lse_chunk
-                                    kl_chunk = (orig_p_chunk * (torch.log(orig_p_chunk + 1e-10) - curr_log_probs_topk_chunk)).sum(dim=-1)
-                                    kl_sum_val += kl_chunk.sum()
+                                    
+                                    # 当前 Chunk 的和
+                                    kl_chunk_sum = (orig_p_chunk * (torch.log(orig_p_chunk + 1e-10) - curr_log_probs_topk_chunk)).sum()
+                                    
+                                    # 【核心优化】算完一个 Chunk 立刻反传销毁！
+                                    if step > 0:
+                                        (kl_chunk_sum * kl_scale_factor).backward()
+                                        
+                                    kl_sum_val += kl_chunk_sum.item()
+                                    
                                 reg_loss_val = kl_sum_val / think_len
-                                
+
                             elif args.reg_type == "lm":
                                 with torch.no_grad():
                                     curr_think_hard_ids = torch.empty((1, think_len), dtype=torch.long, device=device)
@@ -661,16 +684,34 @@ def main():
                                         sim_chunk = torch.matmul(chunk_norm, all_embeddings.T.to(device))
                                         curr_think_hard_ids[:, c_start:c_end] = torch.argmax(sim_chunk, dim=-1)
                                 
-                                lm_loss_sum = 0.0
+                                lm_loss_sum_val = 0.0
+                                # LM 缩放因子
+                                lm_scale_factor = args.kl_weight / (max(1, think_len - 1) * num_conns * batch_size_cur)
+                                
                                 for c_start in range(0, think_len - 1, args.chunk_size):
                                     c_end = min(c_start + args.chunk_size, think_len - 1)
                                     h_chunk = last_hidden_detached_pos[[local_idx_pos], think_start + c_start : think_start + c_end, :]
                                     logits_chunk = model.lm_head(h_chunk)
-                                    labels_chunk = curr_think_hard_ids[:, c_start + 1 : c_end + 1]
-                                    loss_chunk = F.cross_entropy(logits_chunk.reshape(-1, logits_chunk.size(-1)), labels_chunk.reshape(-1), reduction='sum')
-                                    lm_loss_sum = lm_loss_sum + loss_chunk
-                                reg_loss_val = lm_loss_sum / max(1, think_len - 1)
+                                    
+                                    # 🐛 【已修复】Label 偏移对齐 Bug，原来是 c_start+1，现在改为 c_start
+                                    labels_chunk = curr_think_hard_ids[:, c_start : c_end]
+                                    
+                                    # 注意：必须用 reduction='sum' 才能正确匹配缩放因子
+                                    loss_chunk_sum = F.cross_entropy(
+                                        logits_chunk.reshape(-1, logits_chunk.size(-1)), 
+                                        labels_chunk.reshape(-1), 
+                                        reduction='sum'
+                                    )
+                                    
+                                    # 【核心优化】算完一个 Chunk 立刻反传销毁！
+                                    if step > 0:
+                                        (loss_chunk_sum * lm_scale_factor).backward()
+                                        
+                                    lm_loss_sum_val += loss_chunk_sum.item()
+                                    
+                                reg_loss_val = lm_loss_sum_val / max(1, think_len - 1)
 
+                                # (保留你的原始评测逻辑)
                                 if c_idx == 0 and step % 5 == 0:
                                     with torch.no_grad():
                                         hard_embeds = model.get_input_embeddings()(curr_think_hard_ids)
@@ -693,7 +734,7 @@ def main():
                                             )
                                             past_key_values = outputs.past_key_values
                                             logits_chunk = outputs.logits
-                                            labels_chunk = curr_think_hard_ids[:, c_start + 1 : c_end + 1]
+                                            labels_chunk = curr_think_hard_ids[:, c_start + 1 : c_end + 1] # 这里保留原切片，因为这是标准前向计算
                                             loss_chunk = F.cross_entropy(
                                                 logits_chunk.reshape(-1, logits_chunk.size(-1)), 
                                                 labels_chunk.reshape(-1), 
@@ -705,44 +746,57 @@ def main():
                                         del outputs, past_key_values, hard_embeds
                                         torch.cuda.empty_cache()
 
-                            # --- [3.3] 负向 CE 损失 (仅 Contrastive 模式) ---
-                            neg_loss_val = torch.tensor(0.0, device=device)
+                            # --- [3.3] 负向 CE 损失 (Contrastive 模式: 处理 0-5K 的连接词，也套用 Chunk) ---
+                            neg_loss_val = 0.0
                             if args.grad_direction == "contrastive" and i in valid_indices_neg:
                                 local_idx_neg = valid_indices_neg.index(i)
                                 _, id_conn_neg = conns[c_idx]
                                 id_conn_neg = id_conn_neg.to(device)
                                 id_pred_neg = ids_pred_list[i]
 
-                                # 负向计算目标：original_conn + pred 整个序列的 CE
                                 neg_target_ids = torch.cat([id_conn_neg, id_pred_neg], dim=1)
-                                # logits 预测起始点为 end_think 的最后一个 token
                                 neg_start_idx = ids_q_list[i].shape[1] + ids_think_list[i].shape[1] - 1
+                                neg_total_len = neg_target_ids.shape[1]
 
-                                target_logits_neg = model.lm_head(last_hidden_detached_neg[[local_idx_neg], neg_start_idx : neg_start_idx + neg_target_ids.shape[1], :])
-                                neg_ce = F.cross_entropy(target_logits_neg.view(-1, target_logits_neg.size(-1)), neg_target_ids.view(-1))
+                                # 负向计算目标：original_conn + pred 整个序列的 CE
                                 # 添加负号以降低其概率，实现对比学习
-                                neg_loss_val = -neg_ce
+                                neg_scale_factor = -1.0 / (neg_total_len * num_conns * batch_size_cur)
+                                neg_loss_sum_val = 0.0
+                                
+                                for c_start in range(0, neg_total_len, args.chunk_size):
+                                    c_end = min(c_start + args.chunk_size, neg_total_len)
+                                    h_chunk_neg = last_hidden_detached_neg[[local_idx_neg], neg_start_idx + c_start : neg_start_idx + c_end, :]
+                                    logits_chunk_neg = model.lm_head(h_chunk_neg)
+                                    labels_chunk_neg = neg_target_ids[:, c_start : c_end]
+                                    
+                                    loss_chunk_neg_sum = F.cross_entropy(
+                                        logits_chunk_neg.reshape(-1, logits_chunk_neg.size(-1)), 
+                                        labels_chunk_neg.reshape(-1), 
+                                        reduction='sum'
+                                    )
+                                    
+                                    # 【核心优化】算完一个 Chunk 立刻反传销毁！
+                                    if step > 0:
+                                        (loss_chunk_neg_sum * neg_scale_factor).backward()
+                                        
+                                    neg_loss_sum_val += loss_chunk_neg_sum.item()
+                                    
+                                # 转换为原本框架需要的正向记录值 (记录的是 -CE)
+                                neg_loss_val = - (neg_loss_sum_val / neg_total_len)
 
-                            # --- [3.4] 组合 Loss 并计算图梯度 ---
-                            s_gt = gt_loss / num_conns
-                            s_neg = neg_loss_val / num_conns
-                            s_reg = reg_loss_val / num_conns
-                            # s_total 会将所有项融合，并在反传时分别流入 detached_pos 和 detached_neg
-                            s_total = s_gt + s_neg + args.kl_weight * s_reg
+                            # --- [3.4] 记录 Metrics 纯数值 ---
+                            s_total_val = s_gt_val + (neg_loss_val / num_conns) + args.kl_weight * (reg_loss_val / num_conns)
 
-                            if step > 0:
-                                (s_total / batch_size_cur).backward()
-
-                            # 记录 Metrics
                             if "total_loss" not in step_metrics[uid]:
                                 step_metrics[uid].update({"total_loss": 0, "gt_loss": 0, "neg_loss": 0, "reg_loss": 0})
-                            step_metrics[uid]["total_loss"] += s_total.item()
-                            step_metrics[uid]["gt_loss"] += s_gt.item()
-                            step_metrics[uid]["neg_loss"] += s_neg.item()
-                            step_metrics[uid]["reg_loss"] += s_reg.item() if isinstance(s_reg, torch.Tensor) else s_reg
+                                
+                            step_metrics[uid]["total_loss"] += s_total_val
+                            step_metrics[uid]["gt_loss"] += s_gt_val
+                            step_metrics[uid]["neg_loss"] += (neg_loss_val / num_conns)
+                            step_metrics[uid]["reg_loss"] += (reg_loss_val / num_conns)
 
-                            epoch_gt_loss_sum += s_gt.item()
-                            epoch_total_loss_sum += s_total.item()
+                            epoch_gt_loss_sum += s_gt_val
+                            epoch_total_loss_sum += s_total_val
 
                         # 将游离显存梯度的图，传回模型真正的大计算图中进行 accumulate（自动汇聚到 curr_think 的叶子节点上）
                         if step > 0:
@@ -782,6 +836,7 @@ def main():
                                 gamma=current_fw_gamma, 
                                 valid_token_indices=current_topk_indices
                             )
+                            p.grad = None
                         p.data = p.data.cpu().pin_memory()
                         
                         if fw_ids is not None:
@@ -1131,7 +1186,7 @@ def main():
                 ce_loss = F.cross_entropy(logits[0, ans_start:ans_end, :], ids_new_ans[0])
 
                 total_loss = kl_loss + args.distill_ce_loss_weight * ce_loss
-                (total_loss / args.distill_grad_accum_steps).backward()
+                (total_loss / (len(batch) * args.distill_grad_accum_steps)).backward()
 
                 batch_loss += total_loss.item()
                 batch_kl += kl_loss.item()
@@ -1145,7 +1200,7 @@ def main():
                 distill_step += 1
 
                                 # 这里只负责周期性评估，不再需要处理 start_eval 的复杂逻辑
-                    local_metrics = torch.tensor([batch_loss, batch_kl, batch_ce], device=device)
+                local_metrics = torch.tensor([batch_loss, batch_kl, batch_ce], device=device)
                 dist.all_reduce(local_metrics, op=dist.ReduceOp.SUM)
 
                 if rank == 0:

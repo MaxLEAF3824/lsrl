@@ -765,7 +765,7 @@ def main():
                     orig_indices_topk = sd["topk_indices"].to(device)
 
                     # target_ids_think 只是普通的 LongTensor，不参与梯度计算，放外面完全安全
-                    target_ids_think = torch.cat([ids_think_list[i][:, 1:], ids_end_think], dim=1)
+                    target_ids_think = ids_think_list[i]
 
                     # === 3. Chunk 循环 ===
                     for c_start in range(0, think_len, args.chunk_size):
@@ -783,13 +783,7 @@ def main():
                         kl_chunk = (orig_p_chunk * (torch.log(orig_p_chunk + 1e-10) - curr_log_probs_topk_chunk)).sum(dim=-1)
 
                         # [🔥 修复点 2] 放弃循环外的 torch.cat，直接从叶子节点 curr_think_list[i] 动态切片取所需片段
-                        if c_end < think_len:
-                            # 还没到最后，直接切取对应片段
-                            embeds_chunk = curr_think_list[i][:, 1 + c_start : 1 + c_end, :]
-                        else:
-                            # 最后一个 chunk，拼上结尾的 embeds_end_think
-                            part1 = curr_think_list[i][:, 1 + c_start : think_len, :]
-                            embeds_chunk = torch.cat([part1, embeds_end_think], dim=1)
+                        embeds_chunk = curr_think_list[i][:, c_start : c_end, :]
 
                         target_ids_chunk = target_ids_think[:, c_start:c_end]
                         orig_embeds_chunk = model.get_input_embeddings()(target_ids_chunk).detach()
