@@ -25,17 +25,9 @@ class MathWrongDataset(Dataset):
                             # 既然 len(parts) == 2，直接取 parts[1] 即可
                             after_thinking_text = parts[1] 
                             assert "\\boxed{" in after_thinking_text, f"[{uid}] 缺少 boxed 结果"
-                        else:
-                            # 没有 </think> 分隔符时，将前 80% 的 token 作为 thinking_text
-                            tokens = tok.encode(wrong_response, add_special_tokens=False)
-                            split_idx = int(len(tokens) * thinking_ratio)
-                            
-                            thinking_text = tok.decode(tokens[:split_idx])
-                            # 将剩余的 20% 作为 after_thinking_text，防止后续处理报错
-                            after_thinking_text = tok.decode(tokens[split_idx:])
-                            
-                            # 同样需要确保后 20% 包含结果，如果不包含会触发 except 直接跳过该样本
-                            assert "\\boxed{" in after_thinking_text, f"[{uid}] 截断后的后20%文本中缺少 boxed 结果"
+                            pred_box_text = last_boxed_only_string(after_thinking_text)
+                            connector_text = after_thinking_text.split(pred_box_text)[0] + "\\boxed{"
+                            pred_text = remove_boxed(pred_box_text) + "}\n"
                     else:
                         tokens = tok.encode(wrong_response, add_special_tokens=False)
                         answer_length = len(tokens)

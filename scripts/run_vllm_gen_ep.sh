@@ -28,7 +28,7 @@ done
 # 1. 定义要评测的模型列表
 MODELS=(
     # "Qwen/Qwen3-0.6B"
-    "Qwen/Qwen3-1.7B"
+    # "Qwen/Qwen3-1.7B"
     # "Qwen/Qwen2.5-1.5B-Instruct"
     # "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
     # "/workspace/yiqiuguo/lsrl/checkpoints/radiant-bee-213/step474"
@@ -38,21 +38,22 @@ MODELS=(
     # "Qwen/Qwen3-1.7B-Base"
     # "/workspace/yiqiuguo/verl/checkpoints/verl_grpo_math_gb200/qwen3_1.7b_math_gb200/global_step_550/actor_hf_step_550"
     # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-step0-base/step153"
+    "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen3-1.7b-lm_loss_contrastivedebug/step12"
 )
 
 # 2. 定义要评测的数据集列表
 DATASETS=(
-    "mnoukhov/dapo_math_14k_en_openinstruct"
-    # "HuggingFaceH4/MATH-500"
+    # "mnoukhov/dapo_math_14k_en_openinstruct"
+    "HuggingFaceH4/MATH-500"
     # "KbsdJames/Omni-MATH"
-    # "math-ai/aime25"
-    # "HuggingFaceH4/aime_2024"
-    # "math-ai/amc23"
+    "math-ai/aime25"
+    "HuggingFaceH4/aime_2024"
+    "math-ai/amc23"
 )
 
 # 3. 固定的采样和硬件参数
 NUM_GPUS=4
-N=32
+N=8
 TEMP=1.0
 MAX_TOKENS=8192
 TOP_P=0.95

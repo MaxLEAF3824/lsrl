@@ -16,15 +16,15 @@ torchrun --nproc_per_node=4 /workspace/yiqiuguo/lsrl/latent_optimizer_v7.py \
     --file_path "$DATA_FILE" \
     --run_name latopt-distill-exp-dapo-qwen3-1.7b-$(basename "$0" .sh) \
     --vllm_gpus 0 1 2 3 \
-    --big_batch_size 1024 \
+    --big_batch_size 512 \
     --batch_size 1 \
-    --chunk_size 1024 \
+    --chunk_size 512 \
     --optimizer "frank_wolfe" \
     --learning_rate 2e-3 \
     --fw_gamma 0.1 \
     --steps 50 \
     --kl_weight 0.0 \
-    --eval_every 5 \
+    --eval_every 999 \
     --eval_k 8 \
     --eval_modes pure \
     --mask_strategy "first_k" \
@@ -34,7 +34,9 @@ torchrun --nproc_per_node=4 /workspace/yiqiuguo/lsrl/latent_optimizer_v7.py \
     --reg_type "lm" \
     --max_samples 4000 \
     --early_stop \
-    --early_stop_threshold 5e-4 \
+    --early_stop_threshold 1e-3 \
+    --skip_start_eval \
+    --skip_distill_eval \
     --distill_epochs 3 \
     --distill_lr 2e-5 \
     --distill_ce_loss_weight 0.0 \

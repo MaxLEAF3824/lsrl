@@ -178,12 +178,6 @@ def eval_jsonl_fast(file_path, possible_ks=[1, 4, 8, 16, 32], verbose=False):
         print("📈 评估结果摘要 (Evaluation Summary)")
         print("-" * 60)
         
-        for key, value in summary_results.items():
-            if isinstance(value, float):
-                print(f" 🔹 {key:<20}: \033[1;32m{value:>6.2f}%\033[0m")
-            else:
-                print(f" 🔹 {key:<20}: {value:>7}")
-        
         # 打印收集到的正确回复样例
         print("\n" + "=" * 60)
         print("✅ 示例：正确的回复 (Top 3 Correct Examples)")
@@ -209,6 +203,12 @@ def eval_jsonl_fast(file_path, possible_ks=[1, 4, 8, 16, 32], verbose=False):
             print(f"  🤖 模型回复: {pred_trunc}\n")
             
         print("=" * 60 + "\n")
+        
+        for key, value in summary_results.items():
+            if isinstance(value, float):
+                print(f" 🔹 {key:<20}: \033[1;32m{value:>6.2f}%\033[0m")
+            else:
+                print(f" 🔹 {key:<20}: {value:>7}")
         
     return summary_results
 

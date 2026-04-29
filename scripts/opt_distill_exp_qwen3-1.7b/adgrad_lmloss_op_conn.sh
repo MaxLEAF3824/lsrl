@@ -17,7 +17,7 @@ torchrun --nproc_per_node=4 /workspace/yiqiuguo/lsrl/latent_optimizer_v7.py \
     --file_path "$DATA_FILE" \
     --run_name latopt-distill-exp-dapo-qwen3-1.7b-$(basename "$0" .sh) \
     --vllm_gpus 0 1 2 3 \
-    --big_batch_size 1024 \
+    --big_batch_size 512 \
     --batch_size 1 \
     --chunk_size 1024 \
     --optimizer "frank_wolfe" \

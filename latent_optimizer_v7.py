@@ -1,5 +1,6 @@
 import os
 os.environ["VLLM_LOGGING_LEVEL"] = "WARNING"
+os.environ["FLASHINFER_LOG_LEVEL"] = "WARNING"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import json
 import math
@@ -78,7 +79,7 @@ def parse_args():
     
     # [🌟 新增蒸馏控制与持久化参数]
     parser.add_argument("--distill_only", action="store_true", help="跳过优化阶段，直接从本地加载数据集进行蒸馏")
-    parser.add_argument("--distill_dataset_path", type=str, default="./distill_dataset.pt", help="蒸馏数据集持久化保存/读取路径")
+    parser.add_argument("--distill_dataset_path", type=str, default="./default_distill_dataset.pt", help="蒸馏数据集读取路径")
     parser.add_argument("--skip_distill_eval", action="store_true", help="跳过蒸馏阶段的所有评测。如果同时开启 distill_only，则不会初始化vLLM以节省显存")
     
     return parser.parse_args()
@@ -131,7 +132,7 @@ def main():
                 dtype="bfloat16",
                 enable_prompt_embeds=True,
                 max_model_len=32768,
-                enforce_eager=False,  
+                enforce_eager=True,  
             )
 
     def get_embeds(text):
@@ -239,7 +240,7 @@ def main():
             tqdm.write(f"[R{rank}] ⚠️ Step {eval_step}: 暂无分配到数据，参与空轮转以保持 NCCL 同步...")
 
         modes = ["pure", "forced", "fast"]
-        max_toks = {"pure": 4096, "forced": 32, "fast": 32}
+        max_toks = {"pure": 8192, "forced": 32, "fast": 32}
         my_results = {}
 
         # ⚠️ CRITICAL FIX: All ranks MUST enter the generate loop, even with empty inputs.
@@ -418,8 +419,8 @@ def main():
                         mask = torch.zeros((1, info["ids_think"].shape[1]), dtype=torch.float32, device=device)
                         mask[:, : real_mask_max_k] = 1.0
 
-                    # [🌟 修改点] 预计算 Logits 时扩大 Top-K 至 1000 用于蒸馏截断保存
-                    topk_probs, topk_indices = torch.topk(probs, k=1000, dim=-1)
+                    # [🌟 修改点] 预计算 Logits 时扩大 Top-K 至 100 用于蒸馏截断保存
+                    topk_probs, topk_indices = torch.topk(probs, k=100, dim=-1)
                     static_data_cpu[uid] = {
                         "ids_q": info["ids_q"].cpu(),
                         "ids_conn": info["ids_conn"].cpu(),
@@ -720,7 +721,7 @@ def main():
                                 if args.grad_direction == "contrastive" and last_hidden_neg is not None and last_hidden_detached_neg.grad is not None:
                                     last_hidden_neg.backward(last_hidden_detached_neg.grad)
                             
-                            del last_hidden_pos, last_hidden_detached_pos, full_embeds_batch_pos, full_attention_mask_pos
+                            del last_hidden_pos, last_hidthink_embeds_ids和think_embeds_weightden_detached_pos, full_embeds_batch_pos, full_attention_mask_pos
                             if args.grad_direction == "contrastive":
                                 del last_hidden_neg, last_hidden_detached_neg
                                 if 'full_embeds_batch_neg' in locals():
@@ -844,8 +845,8 @@ def main():
 
                     probs = F.softmax(think_logits, dim=-1)
                     
-                    # [🌟 修改点] 截断保存 Logits (仅 Top-1000)
-                    topk_probs_1000, topk_indices_1000 = torch.topk(probs, k=1000, dim=-1)
+                    # [🌟 修改点] 截断保存 Logits (仅 Top-100)
+                    topk_probs_100, topk_indices_100 = torch.topk(probs, k=100, dim=-1)
 
                     # [🌟 修改点] 将蒸馏要素打包进专门的 key
                     local_distill_dataset.append(
@@ -856,8 +857,8 @@ def main():
                             "distill_data": {
                                 "ids_q": sd["ids_q"].cpu(),
                                 "ids_orig_think": sd["ids_think"].cpu(),
-                                "target_probs": topk_probs_1000.cpu(),
-                                "target_indices": topk_indices_1000.cpu(),
+                                "target_probs": topk_probs_100.cpu(),
+                                "target_indices": topk_indices_100.cpu(),
                                 "ids_new_ans": torch.tensor([best_output_ids], dtype=torch.long).cpu(),
                             }
                         }
@@ -879,9 +880,10 @@ def main():
         if rank == 0:
             global_distill_dataset = [item for sublist in all_distill for item in sublist]
             # [🌟 新增功能] 持久化保存蒸馏集到本地
-            os.makedirs(os.path.dirname(args.distill_dataset_path), exist_ok=True)
-            print(f"💾 [Rank 0] 正在持久化保存蒸馏数据集至: {args.distill_dataset_path}")
-            torch.save(global_distill_dataset, args.distill_dataset_path)
+            distill_dataset_save_path = f"./distill_datasets/{run_name}/distill_dataset.pt"
+            os.makedirs(os.path.dirname(distill_dataset_save_path), exist_ok=True)
+            print(f"💾 [Rank 0] 正在持久化保存蒸馏数据集至: {distill_dataset_save_path}")
+            torch.save(global_distill_dataset, distill_dataset_save_path)
         else:
             global_distill_dataset = [None]
 
