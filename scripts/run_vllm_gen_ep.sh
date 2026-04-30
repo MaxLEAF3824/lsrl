@@ -52,17 +52,17 @@ MODELS=(
     # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_all_harddebug/step109"
     # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_all_harddebug/step195"
     # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_conn_harddebug/step33"
-    # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_conn_harddebug/step114"
+    "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_conn_harddebug/step114"
     # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_conn_harddebug/step197"
     # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_opsddebug/step35"
-    "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_opsddebug/step108"
+    # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_opsddebug/step108"
     # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_opsddebug/step200"
 )
 
 # 2. 定义要评测的数据集列表
 DATASETS=(
     # "mnoukhov/dapo_math_14k_en_openinstruct"
-    "HuggingFaceH4/MATH-500"
+    # "HuggingFaceH4/MATH-500"
     # "KbsdJames/Omni-MATH"
     "math-ai/aime25"
     "HuggingFaceH4/aime_2024"
