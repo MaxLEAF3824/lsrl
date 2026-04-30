@@ -3,8 +3,8 @@
 # ==========================================
 # 0. 接收并解析命令行参数
 # ==========================================
-# 设置默认值，防止没传参数时报错
-RUN_SEED=26418
+# 设置默认值
+RUN_SEED=26429
 NODE_TOTAL=1
 NODE_RANK=0
 export WANDB_API_KEY=469ecac017511ec7e2e95fc2f1bab23668dfc776
@@ -13,12 +13,20 @@ export WANDB_API_KEY=469ecac017511ec7e2e95fc2f1bab23668dfc776
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         --RUN_SEED) RUN_SEED="$2"; shift ;;
-        --NODE_TOTAL|--NT|-NT) NODE_TOTAL="$2"; shift ;;
-        --NODE_RANK|--NR|-NR) NODE_RANK="$2"; shift ;;
+        --TR|-TR) 
+            # 将传入的 "3,0" 按逗号切分
+            IFS=',' read -r NODE_TOTAL NODE_RANK <<< "$2"
+            shift ;;
         *) echo "❌ 报错: 遇到未知参数 $1"; exit 1 ;;
     esac
     shift
 done
+
+# 简单的参数校验
+if [[ -z "$NODE_TOTAL" || -z "$NODE_RANK" ]]; then
+    echo "❌ 错误: -TR 参数格式应为 总数,排名 (例如: -TR 3,0)"
+    exit 1
+fi
 
 
 # ==========================================
@@ -38,7 +46,17 @@ MODELS=(
     # "Qwen/Qwen3-1.7B-Base"
     # "/workspace/yiqiuguo/verl/checkpoints/verl_grpo_math_gb200/qwen3_1.7b_math_gb200/global_step_550/actor_hf_step_550"
     # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-step0-base/step153"
-    "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen3-1.7b-lm_loss_contrastivedebug/step12"
+    # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen3-1.7b-lm_loss_contrastivedebug/step12"
+    # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastivedebug/step17"
+    # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_all_harddebug/step36"
+    # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_all_harddebug/step109"
+    # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_all_harddebug/step195"
+    # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_conn_harddebug/step33"
+    # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_conn_harddebug/step114"
+    # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_conn_harddebug/step197"
+    # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_opsddebug/step35"
+    "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_opsddebug/step108"
+    # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_opsddebug/step200"
 )
 
 # 2. 定义要评测的数据集列表
@@ -53,9 +71,9 @@ DATASETS=(
 
 # 3. 固定的采样和硬件参数
 NUM_GPUS=4
-N=8
+N=32
 TEMP=1.0
-MAX_TOKENS=8192
+MAX_TOKENS=32768
 TOP_P=0.95
 
 cd /workspace/yiqiuguo/lsrl

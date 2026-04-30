@@ -24,13 +24,37 @@ from vllm import LLM, SamplingParams
 from frank_wolfe_optimizer import FrankWolfeOptimizer
 
 # =========================================================================
-# [🌟] 辅助函数：跨设备搬运优化器状态
+# [🌟] 辅助函数：跨设备搬运优化器状态 & Token 混合比例更新
 # =========================================================================
 def move_optimizer_state(optimizer, device):
     for param, state in optimizer.state.items():
         for k, v in state.items():
             if isinstance(v, torch.Tensor):
                 state[k] = v.to(device)
+
+# [🌟 修改点1] 新增函数：用于维护每个位置的 Soft Token IDs 混合比例
+def update_token_mix(current_mix, fw_ids, fw_weights, mask):
+    """
+    更新 token 混合字典。
+    current_mix: list of dict, 形如 [{'1024': 1.0}, {'200': 0.8, '300': 0.2}, ...]
+    fw_ids: Tensor (seq_len,)
+    fw_weights: Tensor (seq_len,)
+    mask: Tensor (seq_len,)
+    """
+    for i in range(len(current_mix)):
+        m = mask[i].item()
+        if m > 0:
+            w = fw_weights[i].item() * m  # 实际应用的更新步长
+            new_id = str(int(fw_ids[i].item()))
+            
+            # 原有比例衰减 (1 - w)
+            for k in current_mix[i].keys():
+                current_mix[i][k] *= (1.0 - w)
+                
+            # 加上新的 fw_id 比例
+            current_mix[i][new_id] = current_mix[i].get(new_id, 0.0) + w
+    return current_mix
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -67,20 +91,25 @@ def parse_args():
     parser.add_argument("--early_stop_threshold", type=float, default=1e-3)
     parser.add_argument("--skip_distill", action="store_true")
     parser.add_argument("--skip_start_eval", action="store_true")
-    parser.add_argument("--distill_epochs", type=int, default=3)
+    parser.add_argument("--distill_epochs", type=int, default=1)
     parser.add_argument("--distill_lr", type=float, default=2e-5)
     parser.add_argument("--distill_ce_loss_weight", type=float, default=1.0)
+
+    # [🌟 修改点3.1] 移除旧版参数，新增蒸馏类型和截断参数
+    parser.add_argument("--distill_type", type=str, default="original_soft_kl", 
+                        choices=["original_soft_kl", "new_soft_kl", "opsd", "conn_hard", "all_hard"])
+    parser.add_argument("--max_distill_length", type=int, default=1024, help="OPSD模式下截取计算KL的最大长度")
+    
     parser.add_argument("--distill_eval_every", type=int, default=99999)
     parser.add_argument("--distill_eval_datasets", type=str, nargs="+", default=["HuggingFaceH4/MATH-500"])
-    parser.add_argument("--distill_eval_max_tokens", type=int, default=32768)
+    parser.add_argument("--distill_eval_max_tokens", type=int, default=8192)
     parser.add_argument("--distill_batch_size", type=int, default=1)
     parser.add_argument("--distill_grad_accum_steps", type=int, default=4)
     parser.add_argument("--max_samples", type=int, default=9999999)
     
-    # [🌟 新增蒸馏控制与持久化参数]
     parser.add_argument("--distill_only", action="store_true", help="跳过优化阶段，直接从本地加载数据集进行蒸馏")
     parser.add_argument("--distill_dataset_path", type=str, default="./default_distill_dataset.pt", help="蒸馏数据集读取路径")
-    parser.add_argument("--skip_distill_eval", action="store_true", help="跳过蒸馏阶段的所有评测。如果同时开启 distill_only，则不会初始化vLLM以节省显存")
+    parser.add_argument("--skip_distill_eval", action="store_true", help="跳过蒸馏阶段的所有评测")
     
     return parser.parse_args()
 
@@ -91,10 +120,7 @@ def parse_args():
 def main():
     args = parse_args()
 
-    dist.init_process_group(
-        backend="nccl", 
-        timeout=datetime.timedelta(hours=2) 
-    )
+    dist.init_process_group(backend="nccl", timeout=datetime.timedelta(hours=2))
 
     world_size = dist.get_world_size()
     rank = dist.get_rank()
@@ -115,7 +141,6 @@ def main():
     model.requires_grad_(False)
     model.eval()
 
-    # [🌟 显存优化] 如果是纯蒸馏且不评测，则完全不启动 vLLM
     need_vllm = not (args.distill_only and args.skip_distill_eval)
     vllm_engine = None
     if need_vllm:
@@ -142,9 +167,7 @@ def main():
     embeds_fast_conn, ids_fast_conn = get_embeds("\nTherefore, the final answer is \n$$\n\\boxed{")
     all_embeddings = model.get_input_embeddings().weight.detach()
 
-    if rank == 0:
-        print(f"📄 读取文件: {args.file_path}")
-    
+    if rank == 0: print(f"📄 读取文件: {args.file_path}")
     wrong_dataset = build_math_wrong_dataset(args.file_path, tokenizer, args.thinking_ratio, args.max_samples)
     
     all_raw_data = wrong_dataset.flat_data
@@ -160,6 +183,9 @@ def main():
 
     local_history = {d["uid"]: {"uid": d["uid"], "problem": d["question_text"], "gt_text": d["gt_text"], "steps": []} for d in my_raw_data}
     local_distill_dataset = []
+    
+    # [🌟 修改点1] 初始化软 token 记录的字典
+    global_token_mixes = {}
     
     embeds_fast_conn_cpu = embeds_fast_conn.cpu()
 
@@ -192,16 +218,13 @@ def main():
     pos_mini = rank * 3 + 2
 
     # ==================================================
-    # [🚀 同步评估逻辑]
+    # [🚀 同步评估逻辑] （此处维持不变，计算 ACC 和纯模型前向）
     # ==================================================
     def run_eval_sync(eval_step, eval_uids, latents_snapshot, chunk_static_data, return_valid_answers=False):
         if vllm_engine is None: return {}
         step_metrics = {uid: {} for uid in eval_uids}
-        local_pure_acc, local_forced_acc, local_fast_acc = 0.0, 0.0, 0.0
-        local_total_change_ratio = 0.0
-        valid_answers = {}
-        
-        eval_pure_inputs, eval_forced_inputs, eval_fast_inputs = [], [], []
+        local_pure_acc, local_forced_acc, local_fast_acc, local_total_change_ratio = 0.0, 0.0, 0.0, 0.0
+        valid_answers, eval_pure_inputs, eval_forced_inputs, eval_fast_inputs = {}, [], [], []
         
         if len(eval_uids) > 0:
             tqdm.write(f"\n[R{rank}] 🚀 [评测] Step {eval_step} 启动! 正在 {device} 计算潜空间漂移...")
@@ -243,7 +266,6 @@ def main():
         max_toks = {"pure": 8192, "forced": 32, "fast": 32}
         my_results = {}
 
-        # ⚠️ CRITICAL FIX: All ranks MUST enter the generate loop, even with empty inputs.
         for mode in args.eval_modes:
             if mode == "pure": inputs_tensors = eval_pure_inputs
             elif mode == "forced": inputs_tensors = eval_forced_inputs
@@ -252,7 +274,6 @@ def main():
             with torch.cuda.device(device):
                 vllm_inputs = [{"prompt_embeds": emb.contiguous().cpu()} for emb in inputs_tensors]
                 sp = SamplingParams(max_tokens=max_toks[mode], temperature=1.0, n=args.eval_k, skip_special_tokens=False)
-                # Always called, ensuring vLLM internal DP all_reduces stay perfectly synced
                 outputs = vllm_engine.generate(vllm_inputs, sampling_params=sp, use_tqdm=(rank == 0))
 
             my_results[mode] = []
@@ -270,8 +291,7 @@ def main():
 
                     if len(batch_outputs) > 0:
                         for output_ids in batch_outputs[idx]:
-                            if mode != "pure":
-                                output_ids = output_ids[:gt_token_len]
+                            if mode != "pure": output_ids = output_ids[:gt_token_len]
                             gen_text = tokenizer.decode(output_ids, skip_special_tokens=True)
                             is_corr = False
 
@@ -281,57 +301,38 @@ def main():
                                     if return_valid_answers and uid not in valid_answers:
                                         valid_answers[uid] = output_ids
                                 else:
-                                    if "wrong_answers" not in step_metrics[uid]:
-                                        step_metrics[uid]["wrong_answers"] = []
+                                    if "wrong_answers" not in step_metrics[uid]: step_metrics[uid]["wrong_answers"] = []
                                     step_metrics[uid]["wrong_answers"].append(gen_text)
                             else:
                                 ans = gen_text.replace("$", "").replace("}", "").strip()
-                                if is_equiv(ans, gt_text.replace("}", "")):
-                                    is_corr = True
+                                if is_equiv(ans, gt_text.replace("}", "")): is_corr = True
 
-                            if is_corr:
-                                correct_count += 1
+                            if is_corr: correct_count += 1
 
                     acc = correct_count / args.eval_k if args.eval_k > 0 else 0
                     step_metrics[uid][f"{mode}_acc"] = acc
 
                     if mode == "pure" and len(batch_outputs[idx]) > 0:
-                        sample_gen = tokenizer.decode(batch_outputs[idx][0], skip_special_tokens=True)
-                        step_metrics[uid]["sample_gen_text"] = sample_gen
+                        step_metrics[uid]["sample_gen_text"] = tokenizer.decode(batch_outputs[idx][0], skip_special_tokens=True)
                     
                     if mode == "pure": local_pure_acc += acc
                     elif mode == "forced": local_forced_acc += acc
                     elif mode == "fast": local_fast_acc += acc
 
-        # Safely hit by all ranks now
-        local_counts = torch.tensor([
-            local_pure_acc, 
-            local_forced_acc, 
-            local_fast_acc, 
-            local_total_change_ratio, 
-            len(eval_uids)
-        ], dtype=torch.float32, device=device)
-
+        local_counts = torch.tensor([local_pure_acc, local_forced_acc, local_fast_acc, local_total_change_ratio, len(eval_uids)], dtype=torch.float32, device=device)
         dist.all_reduce(local_counts, op=dist.ReduceOp.SUM)
-        
         global_uids_count = local_counts[4].item()
 
         avg_metrics = {}
         if global_uids_count > 0:
-            avg_metrics = {
-                "eval/avg_pure_acc": local_counts[0].item() / global_uids_count,
-                "eval/avg_forced_acc": local_counts[1].item() / global_uids_count,
-                "eval/avg_fast_acc": local_counts[2].item() / global_uids_count,
-                "eval/avg_change_ratio": local_counts[3].item() / global_uids_count, 
-            }
+            avg_metrics = {"eval/avg_pure_acc": local_counts[0].item() / global_uids_count, "eval/avg_forced_acc": local_counts[1].item() / global_uids_count, "eval/avg_fast_acc": local_counts[2].item() / global_uids_count, "eval/avg_change_ratio": local_counts[3].item() / global_uids_count}
             
         res = {"step": eval_step, "uids": eval_uids, "step_metrics": step_metrics, "avg_metrics": avg_metrics}
         if return_valid_answers: res["valid_answers"] = valid_answers
         return res    
     
     def process_eval_results(res):
-        if res is None or not res:
-            return
+        if not res: return
         eval_step, eval_uids, eval_metrics = res["step"], res["uids"], res["step_metrics"]
         if rank == 0:
             metrics_display = "  ".join([f"{k.replace('eval/avg_', '')}: {v:.4f}" for k, v in res["avg_metrics"].items()])
@@ -373,6 +374,9 @@ def main():
                     curr_think = torch.nn.Parameter(embeds_think.detach().cpu().clone())
                     global_latents[uid] = curr_think
 
+                    # [🌟 修改点1] 注册最初的 Token 权重，1.0 是确定的 Original IDs
+                    global_token_mixes[uid] = [{str(token_id): 1.0} for token_id in ids_think[0].tolist()]
+
                     think_start_idx = ids_q.shape[1] - 1
                     think_end_idx = think_start_idx + ids_think.shape[1]
                     full_emb = torch.cat([embeds_q, embeds_think, embeds_conn], dim=1)
@@ -406,10 +410,8 @@ def main():
                     uid = info["uid"]
                     probs = F.softmax(all_logits[j, info["start"] : info["end"], :].unsqueeze(0), dim=-1)
 
-                    if 0 < args.mask_max_k < 1:
-                        real_mask_max_k = int(args.mask_max_k * probs.shape[1])
-                    else:
-                        real_mask_max_k = int(args.mask_max_k)
+                    if 0 < args.mask_max_k < 1: real_mask_max_k = int(args.mask_max_k * probs.shape[1])
+                    else: real_mask_max_k = int(args.mask_max_k)
                     
                     if args.mask_strategy == "top_k_entropy":
                         entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)
@@ -419,7 +421,6 @@ def main():
                         mask = torch.zeros((1, info["ids_think"].shape[1]), dtype=torch.float32, device=device)
                         mask[:, : real_mask_max_k] = 1.0
 
-                    # [🌟 修改点] 预计算 Logits 时扩大 Top-K 至 100 用于蒸馏截断保存
                     topk_probs, topk_indices = torch.topk(probs, k=100, dim=-1)
                     static_data_cpu[uid] = {
                         "ids_q": info["ids_q"].cpu(),
@@ -450,8 +451,7 @@ def main():
 
                 local_active_count = torch.tensor([len(active_uids)], device=device, dtype=torch.int32)
                 dist.all_reduce(local_active_count, op=dist.ReduceOp.SUM)
-                if local_active_count.item() == 0:
-                    break
+                if local_active_count.item() == 0: break
 
                 current_lr = 0.0
                 epoch_gt_loss_sum, epoch_kl_loss_sum, epoch_lm_loss_sum, epoch_total_loss_sum = 0.0, 0.0, 0.0, 0.0
@@ -482,15 +482,13 @@ def main():
                             curr_mask_list.append(sd["grad_mask"].to(device))
                             p = global_latents[uid]
                             p.data = p.data.to(device)
-                            if p.grad is not None:
-                                p.grad.data = p.grad.data.to(device)
+                            if p.grad is not None: p.grad.data = p.grad.data.to(device)
                             curr_think_list.append(p)
 
                             if args.optimizer == "adam":
                                 opt = global_opts[uid]
                                 move_optimizer_state(opt, device)
-                                for pg in opt.param_groups:
-                                    pg["lr"] = current_lr
+                                for pg in opt.param_groups: pg["lr"] = current_lr
                             elif args.optimizer == "frank_wolfe" and p.grad is not None:
                                 p.grad.zero_()
 
@@ -509,30 +507,25 @@ def main():
                         max_conns = 1
                         if args.conn_type == "on-policy":
                             max_conns = max([len(static_data_cpu[uid].get("active_conns", [(None, None)])) for uid in batch_uids])
-
                         batch_size_cur = len(batch_uids)
                         
                         for c_idx in range(max_conns):
-                            full_embeds_list_pos = []
-                            full_embeds_list_neg = []
-                            valid_indices_pos = []
-                            valid_indices_neg = []
+                            # [省略前向传播、对比方向及 Loss 计算逻辑：维持原有，无需改动]
+                            full_embeds_list_pos, full_embeds_list_neg = [], []
+                            valid_indices_pos, valid_indices_neg = [], []
                             
                             for i, uid in enumerate(batch_uids):
                                 sd = static_data_cpu[uid]
                                 conns = sd.get("active_conns", [(sd["embeds_conn_cpu"], sd["ids_conn"])])
-                                
                                 if args.grad_direction == "contrastive":
                                     emb_conn_pos = embeds_fast_conn_cpu.to(device)
                                     target_emb_pos = embeds_gt_list[i]
                                     full_emb_pos = torch.cat([embeds_q_list[i], curr_think_list[i].to(model.dtype), emb_conn_pos, target_emb_pos], dim=1)
                                     full_embeds_list_pos.append(full_emb_pos)
                                     valid_indices_pos.append(i)
-                                    
                                     if c_idx < len(conns):
                                         emb_conn_neg, _ = conns[c_idx]
-                                        target_emb_neg = embeds_pred_list[i]
-                                        full_emb_neg = torch.cat([embeds_q_list[i], curr_think_list[i].to(model.dtype), emb_conn_neg.to(device), target_emb_neg], dim=1)
+                                        full_emb_neg = torch.cat([embeds_q_list[i], curr_think_list[i].to(model.dtype), emb_conn_neg.to(device), embeds_pred_list[i]], dim=1)
                                         full_embeds_list_neg.append(full_emb_neg)
                                         valid_indices_neg.append(i)
                                 else:
@@ -581,11 +574,9 @@ def main():
                                     last_hidden_neg = model.model(inputs_embeds=full_embeds_batch_neg, attention_mask=full_attention_mask_neg).last_hidden_state
                                     last_hidden_detached_neg = last_hidden_neg.detach().requires_grad_(True)
 
-
                             for i, uid in enumerate(batch_uids):
                                 if i not in valid_indices_pos: continue
                                 local_idx_pos = valid_indices_pos.index(i)
-
                                 sd = static_data_cpu[uid]
                                 conns = sd.get("active_conns", [(sd["embeds_conn_cpu"], sd["ids_conn"])])
                                 num_conns = len(conns)
@@ -619,23 +610,17 @@ def main():
                                     kl_sum_val = 0.0
                                     kl_scale_factor = args.kl_weight / (think_len * num_conns * batch_size_cur)
                                     orig_probs_topk, orig_indices_topk = sd["topk_probs"].to(device), sd["topk_indices"].to(device)
-                                    
                                     for c_start in range(0, think_len, args.chunk_size):
                                         c_end = min(c_start + args.chunk_size, think_len)
                                         h_chunk = last_hidden_detached_pos[[local_idx_pos], think_start + c_start : think_start + c_end, :]
                                         logits_chunk = model.lm_head(h_chunk)
                                         lse_chunk = torch.logsumexp(logits_chunk, dim=-1, keepdim=True)
-
                                         orig_p_chunk = orig_probs_topk[:, c_start:c_end, :]
                                         orig_idx_chunk = orig_indices_topk[:, c_start:c_end, :]
                                         curr_log_probs_topk_chunk = torch.gather(logits_chunk, -1, orig_idx_chunk) - lse_chunk
                                         kl_chunk_sum = (orig_p_chunk * (torch.log(orig_p_chunk + 1e-10) - curr_log_probs_topk_chunk)).sum()
-                                        
-                                        if step > 0:
-                                            (kl_chunk_sum * kl_scale_factor).backward()
-                                            
+                                        if step > 0: (kl_chunk_sum * kl_scale_factor).backward()
                                         kl_sum_val += kl_chunk_sum.item()
-                                        
                                     reg_loss_val = kl_sum_val / think_len
 
                                 elif args.reg_type == "lm":
@@ -676,43 +661,27 @@ def main():
                                     _, id_conn_neg = conns[c_idx]
                                     id_conn_neg = id_conn_neg.to(device)
                                     id_pred_neg = ids_pred_list[i]
-
                                     neg_target_ids = torch.cat([id_conn_neg, id_pred_neg], dim=1)
                                     neg_start_idx = ids_q_list[i].shape[1] + ids_think_list[i].shape[1] - 1
                                     neg_total_len = neg_target_ids.shape[1]
-
                                     neg_scale_factor = -1.0 / (neg_total_len * num_conns * batch_size_cur)
                                     neg_loss_sum_val = 0.0
-                                    
                                     for c_start in range(0, neg_total_len, args.chunk_size):
                                         c_end = min(c_start + args.chunk_size, neg_total_len)
                                         h_chunk_neg = last_hidden_detached_neg[[local_idx_neg], neg_start_idx + c_start : neg_start_idx + c_end, :]
                                         logits_chunk_neg = model.lm_head(h_chunk_neg)
                                         labels_chunk_neg = neg_target_ids[:, c_start : c_end]
-                                        
-                                        loss_chunk_neg_sum = F.cross_entropy(
-                                            logits_chunk_neg.reshape(-1, logits_chunk_neg.size(-1)), 
-                                            labels_chunk_neg.reshape(-1), 
-                                            reduction='sum'
-                                        )
-                                        
-                                        if step > 0:
-                                            (loss_chunk_neg_sum * neg_scale_factor).backward()
-                                            
+                                        loss_chunk_neg_sum = F.cross_entropy(logits_chunk_neg.reshape(-1, logits_chunk_neg.size(-1)), labels_chunk_neg.reshape(-1), reduction='sum')
+                                        if step > 0: (loss_chunk_neg_sum * neg_scale_factor).backward()
                                         neg_loss_sum_val += loss_chunk_neg_sum.item()
-                                        
                                     neg_loss_val = - (neg_loss_sum_val / neg_total_len)
 
                                 s_total_val = s_gt_val + (neg_loss_val / num_conns) + args.kl_weight * (reg_loss_val / num_conns)
-
-                                if "total_loss" not in step_metrics[uid]:
-                                    step_metrics[uid].update({"total_loss": 0, "gt_loss": 0, "neg_loss": 0, "reg_loss": 0})
-                                    
+                                if "total_loss" not in step_metrics[uid]: step_metrics[uid].update({"total_loss": 0, "gt_loss": 0, "neg_loss": 0, "reg_loss": 0})
                                 step_metrics[uid]["total_loss"] += s_total_val
                                 step_metrics[uid]["gt_loss"] += s_gt_val
                                 step_metrics[uid]["neg_loss"] += (neg_loss_val / num_conns)
                                 step_metrics[uid]["reg_loss"] += (reg_loss_val / num_conns)
-
                                 epoch_gt_loss_sum += s_gt_val
                                 epoch_total_loss_sum += s_total_val
 
@@ -721,7 +690,7 @@ def main():
                                 if args.grad_direction == "contrastive" and last_hidden_neg is not None and last_hidden_detached_neg.grad is not None:
                                     last_hidden_neg.backward(last_hidden_detached_neg.grad)
                             
-                            del last_hidden_pos, last_hidthink_embeds_ids和think_embeds_weightden_detached_pos, full_embeds_batch_pos, full_attention_mask_pos
+                            del last_hidden_pos, last_hidden_detached_pos, full_embeds_batch_pos, full_attention_mask_pos
                             if args.grad_direction == "contrastive":
                                 del last_hidden_neg, last_hidden_detached_neg
                                 if 'full_embeds_batch_neg' in locals():
@@ -748,24 +717,30 @@ def main():
                                 
                                 fw_ids, fw_weights = optimizer.step(p, gamma=current_fw_gamma, valid_token_indices=current_topk_indices)
                                 p.grad = None
+                                
+                                # [🌟 修改点1] 实时记录与更新 Token 混合分布
+                                global_token_mixes[uid] = update_token_mix(
+                                    current_mix=global_token_mixes[uid],
+                                    fw_ids=fw_ids.squeeze(0).cpu(),
+                                    fw_weights=fw_weights.squeeze(0).cpu(),
+                                    mask=mask.squeeze(-1).squeeze(0).cpu()
+                                )
+
                             p.data = p.data.cpu().pin_memory()
                             
+                            # 保存 FW action 到日志
                             if fw_ids is not None:
                                 step_metrics[uid]["fw_action_ids"] = fw_ids.cpu().tolist()
                                 step_metrics[uid]["fw_action_weights"] = fw_weights.cpu().tolist()
+                                step_metrics[uid]["curr_token_mix"] = global_token_mixes[uid]
 
                     next_active_uids = []
                     for uid in active_uids:
                         local_history[uid]["steps"].append({"step": global_step_id, "metrics": step_metrics[uid]})
-                        
-                        if args.grad_direction in ["positive","contrastive"]:
-                            is_gt_converged = args.early_stop and step_metrics[uid]["gt_loss"] < args.early_stop_threshold
-                        else:
-                            is_gt_converged = False
+                        if args.grad_direction in ["positive","contrastive"]: is_gt_converged = args.early_stop and step_metrics[uid]["gt_loss"] < args.early_stop_threshold
+                        else: is_gt_converged = False
                         is_pure_acc_converged = uid in global_early_stopped_uids
-                        
-                        if not (is_gt_converged or is_pure_acc_converged):
-                            next_active_uids.append(uid)
+                        if not (is_gt_converged or is_pure_acc_converged): next_active_uids.append(uid)
                             
                     local_active_len = len(active_uids)
                     active_uids = next_active_uids
@@ -826,43 +801,35 @@ def main():
             final_eval_result = run_eval_sync(global_step_id, chunk_all_uids, final_latents_cpu, static_data_cpu, return_valid_answers=True)
             process_eval_results(final_eval_result)
             sync_and_save_history()
-
             valid_answers = final_eval_result.get("valid_answers", {})
 
-            model.eval()
-            with torch.no_grad():
-                for uid, best_output_ids in valid_answers.items():
-                    sd = static_data_cpu[uid]
-                    ct = final_latents_cpu[uid].to(device).to(model.dtype)
-                    emb_q = sd["embeds_q_cpu"].to(device)
+            # [🌟 修改点2] 精简并改造保存给蒸馏数据集的数据
+            for uid, best_output_ids in valid_answers.items():
+                sd = static_data_cpu[uid]
+                
+                # 为 OPSD 预处理 Token
+                p1_text = f"Problem: {local_history[uid]['problem']}\nHere is a reference thinking process:\n"
+                p2_text = "\nAfter understanding the reference thinking process, please try to solve this problem using your own approach below:\nAnswer:\n"
+                opsd_p1_ids = tokenizer.encode(p1_text, return_tensors="pt", add_special_tokens=False).cpu()
+                opsd_p2_ids = tokenizer.encode(p2_text, return_tensors="pt", add_special_tokens=False).cpu()
 
-                    full_emb = torch.cat([emb_q, ct], dim=1)
-                    logits = model(inputs_embeds=full_emb).logits
-
-                    think_start = emb_q.shape[1] - 1
-                    think_end = full_emb.shape[1] - 1
-                    think_logits = logits[0, think_start:think_end, :]
-
-                    probs = F.softmax(think_logits, dim=-1)
-                    
-                    # [🌟 修改点] 截断保存 Logits (仅 Top-100)
-                    topk_probs_100, topk_indices_100 = torch.topk(probs, k=100, dim=-1)
-
-                    # [🌟 修改点] 将蒸馏要素打包进专门的 key
-                    local_distill_dataset.append(
-                        {
-                            "uid": uid,
-                            "gt_text": local_history[uid]["gt_text"],
-                            "problem": local_history[uid]["problem"],
-                            "distill_data": {
-                                "ids_q": sd["ids_q"].cpu(),
-                                "ids_orig_think": sd["ids_think"].cpu(),
-                                "target_probs": topk_probs_100.cpu(),
-                                "target_indices": topk_indices_100.cpu(),
-                                "ids_new_ans": torch.tensor([best_output_ids], dtype=torch.long).cpu(),
-                            }
+                local_distill_dataset.append(
+                    {
+                        "uid": uid,
+                        "gt_text": local_history[uid]["gt_text"],
+                        "problem": local_history[uid]["problem"],
+                        "distill_data": {
+                            "ids_q": sd["ids_q"].cpu(),
+                            "ids_orig_think": sd["ids_think"].cpu(),
+                            "ids_orig_conn": sd["ids_conn"].cpu(),
+                            "ids_orig_pred": sd["ids_pred"].cpu(),     # 用于 OPSD
+                            "ids_new_ans": torch.tensor([best_output_ids], dtype=torch.long).cpu(),
+                            "think_token_mixes": global_token_mixes[uid],  # [🌟] 保存混合轨迹
+                            "opsd_p1_ids": opsd_p1_ids,                    # [🌟] OPSD用 Prompt 1
+                            "opsd_p2_ids": opsd_p2_ids                     # [🌟] OPSD用 Prompt 2
                         }
-                    )
+                    }
+                )
 
             del static_data_cpu, global_latents, final_latents_cpu
             torch.cuda.empty_cache()
@@ -872,21 +839,16 @@ def main():
             if rank == 0: wandb.finish()
             return
 
-        # =========================================================================
-        # [1] 全局蒸馏数据集同步与本地持久化
-        # =========================================================================
         all_distill = [None] * world_size
         dist.all_gather_object(all_distill, local_distill_dataset)
         if rank == 0:
             global_distill_dataset = [item for sublist in all_distill for item in sublist]
-            # [🌟 新增功能] 持久化保存蒸馏集到本地
             distill_dataset_save_path = f"./distill_datasets/{run_name}/distill_dataset.pt"
             os.makedirs(os.path.dirname(distill_dataset_save_path), exist_ok=True)
             print(f"💾 [Rank 0] 正在持久化保存蒸馏数据集至: {distill_dataset_save_path}")
             torch.save(global_distill_dataset, distill_dataset_save_path)
         else:
             global_distill_dataset = [None]
-
         dataset_container = [global_distill_dataset]
         dist.broadcast_object_list(dataset_container, src=0)
         global_distill_dataset = dataset_container[0]
@@ -900,15 +862,11 @@ def main():
             global_distill_dataset = torch.load(args.distill_dataset_path, map_location="cpu")
         else:
             global_distill_dataset = [None]
-
         dataset_container = [global_distill_dataset]
         dist.broadcast_object_list(dataset_container, src=0)
         global_distill_dataset = dataset_container[0]
 
-
-    if rank == 0:
-        print(f"\n🔥 启动 FSDP (ZeRO-2) 模型蒸馏阶段... 过滤后全局总样本数: {len(global_distill_dataset)}")
-
+    if rank == 0: print(f"\n🔥 启动 FSDP 模型蒸馏阶段... 全局总样本数: {len(global_distill_dataset)}")
     if len(global_distill_dataset) == 0:
         if rank == 0: wandb.finish()
         return
@@ -937,13 +895,11 @@ def main():
     # =========================================================================
     def run_distill_eval_sync(step, current_state_dict_path):
         if vllm_engine is None: return
-        if rank == 0: print(f"🔄 [Rank 0] 正在从 {current_state_dict_path} 加载权重至 vLLM...")
-        
+        if rank == 0: print(f"🔄 [Rank 0] 加载权重至 vLLM: {current_state_dict_path}")
         state_dict = torch.load(current_state_dict_path, map_location="cpu")
         executor = vllm_engine.llm_engine.model_executor
         if hasattr(executor, "driver_worker"): vllm_model = executor.driver_worker.model_runner.model
         else: vllm_model = executor.model_runner.model
-
         vllm_model.load_weights(state_dict.items())
         del state_dict
         torch.cuda.empty_cache()
@@ -954,7 +910,7 @@ def main():
         for ds_id, ds_info in eval_datasets.items():
             ds, q_key, a_key = ds_info["data"], ds_info["q_key"], ds_info["a_key"]
             is_pre_formatted = ds_info.get("pre_formatted", False)
-            current_n = 32 if any(x in ds_id for x in ["aime_2024", "aime25", "amc23"]) else 8
+            current_n = 8 if any(x in ds_id for x in ["aime_2024", "aime25", "amc23"]) else 1
 
             prompts = []
             for item in ds:
@@ -963,7 +919,6 @@ def main():
 
             sp = SamplingParams(max_tokens=8192, temperature=1.0, n=current_n, top_p=0.95, skip_special_tokens=False)
             outputs = vllm_engine.generate(prompts, sampling_params=sp, use_tqdm=(rank == 0))
-
             if rank == 0:
                 ds_pass1, ds_pass8 = 0.0, 0.0
                 saved_data_list = []
@@ -1018,23 +973,51 @@ def main():
         dist.barrier(device_ids=[local_rank])
 
     # =========================================================================
-    # [4] FSDP ZeRO-2 初始化
+    # [4] FSDP ZeRO-2 初始化 & 工具函数
     # =========================================================================
     import functools
     from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
     from torch.distributed.fsdp.api import ShardingStrategy
     from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
 
+    # [🌟 修改点3] 获取冻结的完整 embedding，供实时构建 Soft Embeds
+    with torch.no_grad():
+        frozen_embed_layer = model.get_input_embeddings().weight.detach().clone().to(device)
+
+    def mix_to_soft_embeds(token_mixes):
+        """将 token_mixes 转换回 Soft Embeddings (1, seq_len, hidden_dim)"""
+        seq_len = len(token_mixes)
+        dim = frozen_embed_layer.shape[1]
+        soft_embs = torch.zeros((1, seq_len, dim), device=device, dtype=model.dtype)
+        for i, mix in enumerate(token_mixes):
+            for token_id_str, weight in mix.items():
+                tid = int(token_id_str)
+                soft_embs[0, i] += weight * frozen_embed_layer[tid]
+        return soft_embs
+
+    def mix_to_hard_ids(token_mixes):
+        """将 token_mixes 转换回 Hard IDs (argmax weight)"""
+        hard_ids = []
+        for mix in token_mixes:
+            best_id = max(mix, key=mix.get)
+            hard_ids.append(int(best_id))
+        return torch.tensor([hard_ids], dtype=torch.long, device=device)
+
     model.config.use_cache = False
     model.requires_grad_(True)
+    
+    if hasattr(model, "get_input_embeddings") and model.get_input_embeddings() is not None:
+        model.get_input_embeddings().requires_grad_(False)
+    if hasattr(model, "get_output_embeddings") and model.get_output_embeddings() is not None:
+        model.get_output_embeddings().requires_grad_(False)
+    elif hasattr(model, "lm_head") and model.lm_head is not None:
+        model.lm_head.requires_grad_(False)
+        
     model.train()
     model.gradient_checkpointing_enable()
 
     transformer_layer_cls = model.model.layers[0].__class__
-    my_auto_wrap_policy = functools.partial(
-        transformer_auto_wrap_policy,
-        transformer_layer_cls={transformer_layer_cls},
-    )
+    my_auto_wrap_policy = functools.partial(transformer_auto_wrap_policy, transformer_layer_cls={transformer_layer_cls})
 
     fsdp_model = FSDP(
         model, 
@@ -1045,19 +1028,17 @@ def main():
         sync_module_states=True,
     )
     
-    distill_optimizer = torch.optim.AdamW(fsdp_model.parameters(), lr=args.distill_lr)
+    trainable_params = [p for p in fsdp_model.parameters() if p.requires_grad]
+    distill_optimizer = torch.optim.AdamW(trainable_params, lr=args.distill_lr)
+
     sampler = DistributedSampler(global_distill_dataset, num_replicas=world_size, rank=rank, shuffle=True)
-
     def distill_collate_fn(batch): return batch
-
     dataloader = DataLoader(global_distill_dataset, batch_size=args.distill_batch_size, sampler=sampler, collate_fn=distill_collate_fn)
 
     shm_model_path = "/dev/shm/distill_model_weights.pt"
     distill_step = 0
-
     save_options = StateDictOptions(full_state_dict=True, cpu_offload=True)
 
-    # [🌟 跳过基准测试判断] 
     if not args.skip_distill_eval and not args.skip_start_eval:
         cpu_state_dict = get_model_state_dict(fsdp_model, options=save_options)
         if rank == 0: torch.save(cpu_state_dict, shm_model_path)
@@ -1065,7 +1046,7 @@ def main():
         run_distill_eval_sync(distill_step, shm_model_path)
     
     # =========================================================================
-    # [5] 蒸馏训练大循环
+    # [5] 蒸馏训练大循环 - 全新多模态支持
     # =========================================================================
     for epoch in range(args.distill_epochs):
         sampler.set_epoch(epoch)
@@ -1073,94 +1054,157 @@ def main():
 
         distill_optimizer.zero_grad()
         for b_idx, batch in enumerate(pbar):
-            batch_loss, batch_kl, batch_ce = 0.0, 0.0, 0.0
+            batch_loss = 0.0
 
             for item in batch:
-                # [🌟 修改点] 适配打包后的 distill_data 结构
                 d_data = item["distill_data"]
                 ids_q = d_data["ids_q"].to(device)
-                ids_think = d_data["ids_orig_think"].to(device)
+                ids_orig_think = d_data["ids_orig_think"].to(device)
                 ids_new_ans = d_data["ids_new_ans"].to(device)
-                target_probs = d_data["target_probs"].to(device)
-                target_indices = d_data["target_indices"].to(device)
+                think_mixes = d_data["think_token_mixes"]
 
-                full_ids = torch.cat([ids_q, ids_think, ids_new_ans], dim=1)
-                
-                outputs = fsdp_model(input_ids=full_ids, use_cache=False)
-                logits = outputs.logits
+                # [🌟 修改点3] 五种蒸馏模式前向计算分支
+                if args.distill_type == "original_soft_kl":
+                    soft_think_embeds = mix_to_soft_embeds(think_mixes)
+                    q_embeds = frozen_embed_layer[ids_q.squeeze(0)].unsqueeze(0)
+                    
+                    with torch.no_grad():
+                        teacher_embeds = torch.cat([q_embeds, soft_think_embeds], dim=1)
+                        logits_teacher = fsdp_model(inputs_embeds=teacher_embeds, use_cache=False).logits
+                        
+                    student_ids = torch.cat([ids_q, ids_orig_think], dim=1)
+                    logits_student = fsdp_model(input_ids=student_ids, use_cache=False).logits
 
-                think_start = ids_q.shape[1] - 1
-                think_end = think_start + target_probs.shape[0]
-                pred_think_logits = logits[0, think_start:think_end, :]
+                    # 计算 KL
+                    t_start = ids_q.shape[1] - 1
+                    t_end = student_ids.shape[1] - 1
+                    pred_log_probs = F.log_softmax(logits_student[0, t_start:t_end, :], dim=-1)
+                    target_probs = F.softmax(logits_teacher[0, t_start:t_end, :], dim=-1)
+                    total_loss = F.kl_div(pred_log_probs, target_probs, reduction="batchmean")
 
-                pred_lse = torch.logsumexp(pred_think_logits, dim=-1, keepdim=True)
-                pred_log_probs_topk = torch.gather(pred_think_logits, -1, target_indices) - pred_lse
-                kl_loss = (target_probs * (torch.log(target_probs + 1e-10) - pred_log_probs_topk)).sum(dim=-1).mean()
+                elif args.distill_type == "new_soft_kl":
+                    soft_think_embeds = mix_to_soft_embeds(think_mixes)
+                    q_embeds = frozen_embed_layer[ids_q.squeeze(0)].unsqueeze(0)
+                    
+                    with torch.no_grad():
+                        teacher_embeds = torch.cat([q_embeds, soft_think_embeds], dim=1)
+                        logits_teacher = fsdp_model(inputs_embeds=teacher_embeds, use_cache=False).logits
+                        
+                    hard_think_ids = mix_to_hard_ids(think_mixes)
+                    student_ids = torch.cat([ids_q, hard_think_ids], dim=1)
+                    logits_student = fsdp_model(input_ids=student_ids, use_cache=False).logits
 
-                ans_start = full_ids.shape[1] - ids_new_ans.shape[1] - 1
-                ans_end = full_ids.shape[1] - 1
-                ce_loss = F.cross_entropy(logits[0, ans_start:ans_end, :], ids_new_ans[0])
+                    t_start = ids_q.shape[1] - 1
+                    t_end = student_ids.shape[1] - 1
+                    pred_log_probs = F.log_softmax(logits_student[0, t_start:t_end, :], dim=-1)
+                    target_probs = F.softmax(logits_teacher[0, t_start:t_end, :], dim=-1)
+                    total_loss = F.kl_div(pred_log_probs, target_probs, reduction="batchmean")
 
-                total_loss = kl_loss + args.distill_ce_loss_weight * ce_loss
+                elif args.distill_type == "opsd":
+                    ids_orig_conn = d_data["ids_orig_conn"].to(device)
+                    ids_orig_pred = d_data["ids_orig_pred"].to(device)
+                    p1_ids = d_data["opsd_p1_ids"].to(device)
+                    p2_ids = d_data["opsd_p2_ids"].to(device)
+                    
+                    soft_think_embeds = mix_to_soft_embeds(think_mixes)
+                    p1_embeds = frozen_embed_layer[p1_ids.squeeze(0)].unsqueeze(0)
+                    p2_embeds = frozen_embed_layer[p2_ids.squeeze(0)].unsqueeze(0)
+                    orig_think_embeds = frozen_embed_layer[ids_orig_think.squeeze(0)].unsqueeze(0)
+                    conn_embeds = frozen_embed_layer[ids_orig_conn.squeeze(0)].unsqueeze(0)
+                    pred_embeds = frozen_embed_layer[ids_orig_pred.squeeze(0)].unsqueeze(0)
+                    
+                    # Teacher: P1 + Soft + P2 + Orig_Think + Conn + Pred
+                    with torch.no_grad():
+                        teacher_embeds = torch.cat([p1_embeds, soft_think_embeds, p2_embeds, orig_think_embeds, conn_embeds, pred_embeds], dim=1)
+                        logits_teacher = fsdp_model(inputs_embeds=teacher_embeds, use_cache=False).logits
+                        
+                    # Student: Q + Orig_Think + Conn + Pred
+                    student_ids = torch.cat([ids_q, ids_orig_think, ids_orig_conn, ids_orig_pred], dim=1)
+                    logits_student = fsdp_model(input_ids=student_ids, use_cache=False).logits
+
+                    # 截取对齐后的尾部序列（Orig_Think + Conn + Pred）
+                    tail_len = ids_orig_think.shape[1] + ids_orig_conn.shape[1] + ids_orig_pred.shape[1]
+                    distill_len = min(tail_len, args.max_distill_length)
+                    
+                    # Student 结尾偏移
+                    s_end = student_ids.shape[1] - 1
+                    s_start = s_end - distill_len
+                    # Teacher 结尾偏移
+                    t_end = teacher_embeds.shape[1] - 1
+                    t_start = t_end - distill_len
+
+                    pred_log_probs = F.log_softmax(logits_student[0, s_start:s_end, :], dim=-1)
+                    target_probs = F.softmax(logits_teacher[0, t_start:t_end, :], dim=-1)
+                    total_loss = F.kl_div(pred_log_probs, target_probs, reduction="batchmean")
+
+                elif args.distill_type == "conn_hard":
+                    soft_think_embeds = mix_to_soft_embeds(think_mixes)
+                    q_embeds = frozen_embed_layer[ids_q.squeeze(0)].unsqueeze(0)
+                    ans_embeds = frozen_embed_layer[ids_new_ans.squeeze(0)].unsqueeze(0)
+                    
+                    student_embeds = torch.cat([q_embeds, soft_think_embeds, ans_embeds], dim=1)
+                    logits_student = fsdp_model(inputs_embeds=student_embeds, use_cache=False).logits
+                    
+                    # 仅在 new_answer 处计算 CE
+                    ans_start = student_embeds.shape[1] - ids_new_ans.shape[1] - 1
+                    ans_end = student_embeds.shape[1] - 1
+                    total_loss = F.cross_entropy(logits_student[0, ans_start:ans_end, :], ids_new_ans[0])
+
+                elif args.distill_type == "all_hard":
+                    hard_think_ids = mix_to_hard_ids(think_mixes)
+                    student_ids = torch.cat([ids_q, hard_think_ids, ids_new_ans], dim=1)
+                    logits_student = fsdp_model(input_ids=student_ids, use_cache=False).logits
+                    
+                    # 在 Hard Think + New Answer 处计算 CE
+                    target_ids = torch.cat([hard_think_ids, ids_new_ans], dim=1)
+                    t_start = ids_q.shape[1] - 1
+                    t_end = student_ids.shape[1] - 1
+                    total_loss = F.cross_entropy(logits_student[0, t_start:t_end, :], target_ids[0])
+
                 (total_loss / (len(batch) * args.distill_grad_accum_steps)).backward()
-
                 batch_loss += total_loss.item()
-                batch_kl += kl_loss.item()
-                batch_ce += ce_loss.item()
 
             if (b_idx + 1) % args.distill_grad_accum_steps == 0 or (b_idx + 1) == len(dataloader):
                 fsdp_model.clip_grad_norm_(1.0)
                 distill_optimizer.step()
                 distill_optimizer.zero_grad()
-
                 distill_step += 1
 
-                local_metrics = torch.tensor([batch_loss, batch_kl, batch_ce], device=device)
+                local_metrics = torch.tensor([batch_loss], device=device)
                 dist.all_reduce(local_metrics, op=dist.ReduceOp.SUM)
 
                 if rank == 0:
                     wandb.log({
                         "model_train_step": distill_step,
                         "distill/train/total_loss": local_metrics[0].item() / world_size,
-                        "distill/train/kl_loss": local_metrics[1].item() / world_size,
-                        "distill/train/ce_loss": local_metrics[2].item() / world_size,
                         "distill/train/lr": distill_optimizer.param_groups[0]["lr"],
                     })
                 
-                # [🌟 蒸馏周期性测试条件管控]
                 if not args.skip_distill_eval and distill_step % args.distill_eval_every == 0:
                     cpu_state_dict = get_model_state_dict(fsdp_model, options=save_options)
                     if rank == 0: torch.save(cpu_state_dict, shm_model_path)
                     dist.barrier(device_ids=[local_rank]) 
                     run_distill_eval_sync(distill_step, shm_model_path)
 
-
     # =========================================================================
     # [6] 终局保存与清理
     # =========================================================================
     cpu_state_dict = get_model_state_dict(fsdp_model, options=save_options)
-    if rank == 0:
-        torch.save(cpu_state_dict, shm_model_path)
+    if rank == 0: torch.save(cpu_state_dict, shm_model_path)
     
     dist.barrier(device_ids=[local_rank])
-    # [🌟 终局评估条件管控]
-    if not args.skip_distill_eval:
-        run_distill_eval_sync(distill_step, shm_model_path)
+    if not args.skip_distill_eval: run_distill_eval_sync(distill_step, shm_model_path)
 
     if rank == 0:
         save_dir = f"./checkpoints/{run_name}/step{distill_step}/"
         os.makedirs(save_dir, exist_ok=True)
-        print(f"💾 [Rank 0] 正在将模型序列化到硬盘 (需要一些时间)，其他节点待机中...")
-        
+        print(f"💾 [Rank 0] 正在将模型序列化到硬盘...")
         model.save_pretrained(save_dir, state_dict=cpu_state_dict)
         tokenizer.save_pretrained(save_dir)
-        
         del cpu_state_dict
-        
         print(f"🎉 蒸馏全流程结束！模型权重已保存到 {save_dir}")
         wandb.finish()
-        if os.path.exists(shm_model_path):
-            os.remove(shm_model_path)
+        if os.path.exists(shm_model_path): os.remove(shm_model_path)
 
     dist.barrier(device_ids=[local_rank])
     dist.destroy_process_group()

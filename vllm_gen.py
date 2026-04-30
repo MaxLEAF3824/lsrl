@@ -1,5 +1,8 @@
-import json
 import os
+os.environ["VLLM_LOGGING_LEVEL"] = "WARNING"
+os.environ["FLASHINFER_LOG_LEVEL"] = "WARNING"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+import json
 import time
 import uuid
 import argparse
@@ -301,3 +304,21 @@ if __name__ == "__main__":
                     global_out.write(node_in.read())
                     
         print(f"🚀🚀🚀 全局合并大功告成！完美结果文件: {global_final_output}")
+        # --- 新增：清理所有节点中间文件 ---
+        print("🧹 正在清理各节点临时文件...")
+        for f in all_expected_files:
+            try:
+                if os.path.exists(f):
+                    os.remove(f)
+                    print(f"   Deleted: {os.path.basename(f)}")
+            except Exception as e:
+                print(f"   ⚠️ 无法删除文件 {f}: {e}")
+        print("✨ 临时文件清理完毕。")
+        # ------------------------------
+
+        # 执行评估（如果脚本存在）
+        try:
+            from eval_jsonl import eval_jsonl_fast
+            res = eval_jsonl_fast(global_final_output, possible_ks=[1, 4, 8, 16, 32], verbose=True)
+        except ImportError:
+            print("💡 未找到 eval_jsonl 模块，跳过自动评分。")
