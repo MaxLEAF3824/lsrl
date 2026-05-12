@@ -3,20 +3,23 @@
 # ==========================================
 # 0. 接收并解析命令行参数
 # ==========================================
-# 设置默认值
-RUN_SEED=26429
-NODE_TOTAL=1
-NODE_RANK=0
+# 设置默认值：使用当天的日期作为默认种子 (格式: YYYYMMDD)
+RUN_SEED=$(date +"%Y%m%d")
 export WANDB_API_KEY=469ecac017511ec7e2e95fc2f1bab23668dfc776
 
-# 解析外部传入的参数
+# 1. 直接读取第一个位置参数作为 总数,排名
+if [[ -n "$1" && "$1" == *","* ]]; then
+    IFS=',' read -r NODE_TOTAL NODE_RANK <<< "$1"
+    shift # 移除第一个参数，方便后续如果还有其他参数（如 --RUN_SEED）可以继续解析
+else
+    echo "❌ 错误: 请提供集群配置参数作为第一个参数 (格式: 总数,排名)，例如: bash run_vllm_gen_ep.sh 3,1"
+    exit 1
+fi
+
+# 2. 解析剩余的可选外部传入参数
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         --RUN_SEED) RUN_SEED="$2"; shift ;;
-        --TR|-TR) 
-            # 将传入的 "3,0" 按逗号切分
-            IFS=',' read -r NODE_TOTAL NODE_RANK <<< "$2"
-            shift ;;
         *) echo "❌ 报错: 遇到未知参数 $1"; exit 1 ;;
     esac
     shift
@@ -24,10 +27,9 @@ done
 
 # 简单的参数校验
 if [[ -z "$NODE_TOTAL" || -z "$NODE_RANK" ]]; then
-    echo "❌ 错误: -TR 参数格式应为 总数,排名 (例如: -TR 3,0)"
+    echo "❌ 错误: 节点参数解析失败，格式应为 总数,排名 (例如: 3,1)"
     exit 1
 fi
-
 
 # ==========================================
 # 批量大模型离线数学推理评测脚本
@@ -37,7 +39,9 @@ fi
 MODELS=(
     # "Qwen/Qwen3-0.6B"
     # "Qwen/Qwen3-1.7B"
-    # "Qwen/Qwen2.5-1.5B-Instruct"
+    "Qwen/Qwen2.5-1.5B-Instruct"
+    "Qwen/Qwen3-4B"
+    "Qwen/Qwen3-8B"
     # "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
     # "/workspace/yiqiuguo/lsrl/checkpoints/radiant-bee-213/step474"
     # "/workspace/yiqiuguo/lsrl/checkpoints/gallant-firebrand-212/step688"
@@ -52,7 +56,7 @@ MODELS=(
     # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_all_harddebug/step109"
     # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_all_harddebug/step195"
     # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_conn_harddebug/step33"
-    "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_conn_harddebug/step114"
+    # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_conn_harddebug/step114"
     # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_conn_harddebug/step197"
     # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_opsddebug/step35"
     # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_opsddebug/step108"
@@ -61,22 +65,23 @@ MODELS=(
 
 # 2. 定义要评测的数据集列表
 DATASETS=(
-    # "mnoukhov/dapo_math_14k_en_openinstruct"
+    "mnoukhov/dapo_math_14k_en_openinstruct"
     # "HuggingFaceH4/MATH-500"
     # "KbsdJames/Omni-MATH"
-    "math-ai/aime25"
-    "HuggingFaceH4/aime_2024"
-    "math-ai/amc23"
+    # "math-ai/aime25"
+    # "HuggingFaceH4/aime_2024"
+    # "math-ai/amc23"
 )
 
 # 3. 固定的采样和硬件参数
 NUM_GPUS=4
 N=32
 TEMP=1.0
-MAX_TOKENS=32768
+MAX_TOKENS=8192
 TOP_P=0.95
 
 cd /workspace/yiqiuguo/lsrl
+
 # ==========================================
 # 开始双层循环执行任务
 # ==========================================
