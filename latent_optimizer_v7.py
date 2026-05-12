@@ -97,7 +97,7 @@ def parse_args():
 
     # [🌟 修改点3.1] 移除旧版参数，新增蒸馏类型和截断参数
     parser.add_argument("--distill_type", type=str, default="original_soft_kl", 
-                        choices=["original_soft_kl", "new_soft_kl", "opsd", "conn_hard", "all_hard"])
+                        choices=["original_soft_kl", "new_soft_kl", "opsd", "conn_hard", "all_hard","original_opsd"])
     parser.add_argument("--max_distill_length", type=int, default=1024, help="OPSD模式下截取计算KL的最大长度")
     
     parser.add_argument("--distill_eval_every", type=int, default=99999)
@@ -348,9 +348,69 @@ def main():
     global_early_stopped_uids = set()
 
     # =========================================================================
+    # [🔥 分支1/1.5: 原始 OPSD 分支 (跳过优化，直接组装蒸馏数据)]
+    # =========================================================================
+    if not args.distill_only and args.distill_type == "original_opsd":
+        if rank == 0: print("🚀 [Rank 0] original_opsd 模式：跳过优化阶段，直接从全量数据构建蒸馏数据集...")
+        local_distill_dataset = []
+        for d in tqdm(my_raw_data, desc=f"[R{rank}] 组装 original_opsd 数据", position=rank, leave=False):
+            uid = d["uid"]
+            gt_text = d["gt_text"]
+            
+            # 使用 Tokenizer 快速获取所需 IDs (无需过模型获取 embeds)
+            ids_q = tokenizer.encode(d["question_text"], return_tensors="pt", add_special_tokens=False)
+            ids_think = tokenizer.encode(d["thinking_text"], return_tensors="pt", add_special_tokens=False)
+            if args.conn_type == "original":
+                ids_conn = tokenizer.encode(d["connector_text"], return_tensors="pt", add_special_tokens=False)
+            else:
+                ids_conn = ids_fast_conn.cpu()
+            ids_pred = tokenizer.encode(d["pred_text"], return_tensors="pt", add_special_tokens=False)
+
+            p1_text = f"Problem: {d['question_text']}\nHere is a reference thinking process:\n"
+            p2_text = "\nAfter understanding the reference thinking process, please try to solve this problem using your own approach below:\nAnswer:\n"
+            gt_hint_text = f"The correct answer is {gt_text}"
+            
+            opsd_p1_ids = tokenizer.encode(p1_text, return_tensors="pt", add_special_tokens=False)
+            opsd_p2_ids = tokenizer.encode(p2_text, return_tensors="pt", add_special_tokens=False)
+            gt_hint_ids = tokenizer.encode(gt_hint_text, return_tensors="pt", add_special_tokens=False)
+
+            local_distill_dataset.append({
+                "uid": uid,
+                "gt_text": gt_text,
+                "problem": d["question_text"],
+                "distill_data": {
+                    "ids_q": ids_q,
+                    "ids_orig_think": ids_think,
+                    "ids_orig_conn": ids_conn,
+                    "ids_orig_pred": ids_pred,
+                    "opsd_p1_ids": opsd_p1_ids,
+                    "opsd_p2_ids": opsd_p2_ids,
+                    "gt_hint_ids": gt_hint_ids,
+                    "ids_new_ans": torch.tensor([[]], dtype=torch.long) # 占位防报错
+                }
+            })
+            
+        dist.barrier(device_ids=[local_rank])
+        
+        # 收集全局蒸馏数据集
+        all_distill = [None] * world_size
+        dist.all_gather_object(all_distill, local_distill_dataset)
+        if rank == 0:
+            global_distill_dataset = [item for sublist in all_distill for item in sublist]
+            distill_dataset_save_path = f"./distill_datasets/{run_name}/original_opsd_distill_dataset.pt"
+            os.makedirs(os.path.dirname(distill_dataset_save_path), exist_ok=True)
+            print(f"💾 [Rank 0] 保存 original_opsd 数据集至: {distill_dataset_save_path}")
+            torch.save(global_distill_dataset, distill_dataset_save_path)
+        else:
+            global_distill_dataset = [None]
+        dataset_container = [global_distill_dataset]
+        dist.broadcast_object_list(dataset_container, src=0)
+        global_distill_dataset = dataset_container[0]
+
+    # =========================================================================
     # [🔥 分支1: 执行完整的大循环优化并生成蒸馏集]
     # =========================================================================
-    if not args.distill_only:
+    elif not args.distill_only:
         big_batch_pbar = tqdm(enumerate(raw_data_chunks), total=len(raw_data_chunks), desc=f"[R{rank}] 🌍 Big Batch", position=pos_big, leave=True)
         for chunk_idx, current_raw_data in big_batch_pbar:
             static_data_cpu = {}
@@ -1034,7 +1094,7 @@ def main():
     sampler = DistributedSampler(global_distill_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     def distill_collate_fn(batch): return batch
     dataloader = DataLoader(global_distill_dataset, batch_size=args.distill_batch_size, sampler=sampler, collate_fn=distill_collate_fn)
-
+    print(global_distill_dataset[0])
     shm_model_path = "/dev/shm/distill_model_weights.pt"
     distill_step = 0
     save_options = StateDictOptions(full_state_dict=True, cpu_offload=True)
@@ -1046,11 +1106,11 @@ def main():
         run_distill_eval_sync(distill_step, shm_model_path)
     
     # =========================================================================
-    # [5] 蒸馏训练大循环 - 全新多模态支持
+    # [5] 蒸馏训练大循环
     # =========================================================================
     for epoch in range(args.distill_epochs):
         sampler.set_epoch(epoch)
-        pbar = tqdm(dataloader, desc=f"[R{rank}] Distill Epoch {epoch + 1}/{args.distill_epochs}", leave=False)
+        pbar = tqdm(dataloader, desc=f"[R{rank}] Distill Epoch {epoch + 1}/{args.distill_epochs}", position=pos_big, leave=False)
 
         distill_optimizer.zero_grad()
         for b_idx, batch in enumerate(pbar):
@@ -1061,7 +1121,7 @@ def main():
                 ids_q = d_data["ids_q"].to(device)
                 ids_orig_think = d_data["ids_orig_think"].to(device)
                 ids_new_ans = d_data["ids_new_ans"].to(device)
-                think_mixes = d_data["think_token_mixes"]
+                think_mixes = d_data.get("think_token_mixes", None)
 
                 # [🌟 修改点3] 五种蒸馏模式前向计算分支
                 if args.distill_type == "original_soft_kl":
@@ -1160,7 +1220,45 @@ def main():
                     t_start = ids_q.shape[1] - 1
                     t_end = student_ids.shape[1] - 1
                     total_loss = F.cross_entropy(logits_student[0, t_start:t_end, :], target_ids[0])
+                elif args.distill_type == "original_opsd":
+                    ids_orig_conn = d_data["ids_orig_conn"].to(device)
+                    ids_orig_pred = d_data["ids_orig_pred"].to(device)
+                    p1_ids = d_data["opsd_p1_ids"].to(device)
+                    p2_ids = d_data["opsd_p2_ids"].to(device)
+                    gt_hint_ids = d_data["gt_hint_ids"].to(device)
+                    
+                    q_embeds = frozen_embed_layer[ids_q.squeeze(0)].unsqueeze(0)
+                    p1_embeds = frozen_embed_layer[p1_ids.squeeze(0)].unsqueeze(0)
+                    p2_embeds = frozen_embed_layer[p2_ids.squeeze(0)].unsqueeze(0)
+                    gt_hint_embeds = frozen_embed_layer[gt_hint_ids.squeeze(0)].unsqueeze(0)
+                    orig_think_embeds = frozen_embed_layer[ids_orig_think.squeeze(0)].unsqueeze(0)
+                    conn_embeds = frozen_embed_layer[ids_orig_conn.squeeze(0)].unsqueeze(0)
+                    pred_embeds = frozen_embed_layer[ids_orig_pred.squeeze(0)].unsqueeze(0)
+                    
+                    # Teacher: P1 + GT_Hint + P2 + Orig_Think + Conn + Pred
+                    with torch.no_grad():
+                        teacher_embeds = torch.cat([p1_embeds, gt_hint_embeds, p2_embeds, orig_think_embeds, conn_embeds, pred_embeds], dim=1)
+                        logits_teacher = fsdp_model(inputs_embeds=teacher_embeds, use_cache=False).logits
+                        
+                    # Student: Q + Orig_Think + Conn + Pred (与 OPSD 一致)
+                    student_ids = torch.cat([ids_q, ids_orig_think, ids_orig_conn, ids_orig_pred], dim=1)
+                    logits_student = fsdp_model(input_ids=student_ids, use_cache=False).logits
 
+                    # 截取对齐后的尾部序列（Orig_Think + Conn + Pred）
+                    tail_len = ids_orig_think.shape[1] + ids_orig_conn.shape[1] + ids_orig_pred.shape[1]
+                    distill_len = min(tail_len, args.max_distill_length)
+                    
+                    # Student 结尾偏移
+                    s_end = student_ids.shape[1] - 1
+                    s_start = s_end - distill_len
+                    # Teacher 结尾偏移
+                    t_end = teacher_embeds.shape[1] - 1
+                    t_start = t_end - distill_len
+
+                    pred_log_probs = F.log_softmax(logits_student[0, s_start:s_end, :], dim=-1)
+                    target_probs = F.softmax(logits_teacher[0, t_start:t_end, :], dim=-1)
+                    total_loss = F.kl_div(pred_log_probs, target_probs, reduction="batchmean")
+                
                 (total_loss / (len(batch) * args.distill_grad_accum_steps)).backward()
                 batch_loss += total_loss.item()
 

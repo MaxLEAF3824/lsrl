@@ -6,14 +6,15 @@
 # 设置默认值：使用当天的日期作为默认种子 (格式: YYYYMMDD)
 RUN_SEED=$(date +"%Y%m%d")
 export WANDB_API_KEY=469ecac017511ec7e2e95fc2f1bab23668dfc776
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 
-# 1. 直接读取第一个位置参数作为 总数,排名
+# 1. 直接读取第一个位置参数作为 总数,排名 (如果未提供，则默认为 1,0)
 if [[ -n "$1" && "$1" == *","* ]]; then
     IFS=',' read -r NODE_TOTAL NODE_RANK <<< "$1"
     shift # 移除第一个参数，方便后续如果还有其他参数（如 --RUN_SEED）可以继续解析
 else
-    echo "❌ 错误: 请提供集群配置参数作为第一个参数 (格式: 总数,排名)，例如: bash run_vllm_gen_ep.sh 3,1"
-    exit 1
+    NODE_TOTAL=1
+    NODE_RANK=0
 fi
 
 # 2. 解析剩余的可选外部传入参数
@@ -39,7 +40,7 @@ fi
 MODELS=(
     # "Qwen/Qwen3-0.6B"
     # "Qwen/Qwen3-1.7B"
-    "Qwen/Qwen2.5-1.5B-Instruct"
+    # "Qwen/Qwen2.5-1.5B-Instruct"
     "Qwen/Qwen3-4B"
     "Qwen/Qwen3-8B"
     # "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"

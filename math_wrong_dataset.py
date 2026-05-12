@@ -1,66 +1,143 @@
+import os
+# 必须在导入或使用 transformers 之前设置，防止 HF Tokenizer 的 Rust 后端与多进程发生死锁
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+import json
+from multiprocessing import Pool
+import numpy as np
+from tqdm.auto import tqdm
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer
+
 from math_verify import parse as math_verify_parse
 from math_verify import verify as math_verify_verify
-from torch.utils.data import Dataset, DataLoader
-import json
 from math_utils import is_correct_v3, last_boxed_only_string, remove_boxed, is_equiv
-from tqdm.auto import tqdm
-from transformers import AutoTokenizer
-import numpy as np
 
+# =========================================================================
+# 1. 第一阶段：验证和过滤错误答案 (多进程 Worker)
+# =========================================================================
+def _process_single_item(item):
+    """提取需要处理的题目和 '过程完整但结果错误' 的回复"""
+    gold_answer = item.get("answer", item.get("ground_truth", None))
+    responses = item.get("responses", [])
+    
+    if not any(is_correct_v3(p, gold_answer) for p in responses):
+        complete_but_wrong_responses = []
+        for res in responses:
+            boxed_str = last_boxed_only_string(res)
+            if boxed_str:
+                parsed_res = math_verify_parse(remove_boxed(boxed_str))
+                parsed_gold = math_verify_parse(gold_answer.strip())
+                if not math_verify_verify(parsed_res, parsed_gold):
+                    complete_but_wrong_responses.append(res)
+        
+        if complete_but_wrong_responses:
+            return {
+                "problem": item.get("q", item.get("problem", item.get("question", None))),
+                "gold_answer": gold_answer,
+                "complete_wrong_responses": complete_but_wrong_responses,
+            }
+    return None
+
+# =========================================================================
+# 2. 第二阶段：分词和截断组装 (多进程 Worker)
+# =========================================================================
+_worker_tok = None
+
+def _init_tokenize_worker(tok):
+    global _worker_tok
+    _worker_tok = tok
+
+def _tokenize_and_format_sample(args):
+    """处理单个样本的 Tokenize 和截断逻辑"""
+    sample_idx, sample, thinking_ratio, old_thinking_pattern = args
+    tok = _worker_tok
+    results = []
+    
+    messages = [{"role": "user", "content": sample["problem"]}]
+    question_text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True) + "<think>"
+    gt_text = sample["gold_answer"] + "}\n"
+
+    for response_idx, wrong_response in enumerate(sample["complete_wrong_responses"]):
+        uid = f"sample{sample_idx}_resp{response_idx}"
+        try:
+            answer_length = 0
+            if old_thinking_pattern:
+                parts = wrong_response.split("</think>")
+                if len(parts) == 2:
+                    thinking_text = parts[0]
+                    after_thinking_text = parts[1] 
+                    assert "\\boxed{" in after_thinking_text, f"[{uid}] 缺少 boxed 结果"
+                    
+                    pred_box_text = last_boxed_only_string(after_thinking_text)
+                    connector_text = after_thinking_text.split(pred_box_text)[0] + "\\boxed{"
+                    pred_text = remove_boxed(pred_box_text) + "}\n"
+                    # 为了统计，补算一下长度
+                    answer_length = len(tok.encode(wrong_response, add_special_tokens=False))
+            else:
+                tokens = tok.encode(wrong_response, add_special_tokens=False)
+                answer_length = len(tokens)
+                split_idx = int(len(tokens) * thinking_ratio)
+                thinking_text = tok.decode(tokens[:split_idx])
+                after_thinking_text = tok.decode(tokens[split_idx:])
+                
+                assert "\\boxed{" in after_thinking_text, f"[{uid}] 截断后缺少 boxed 结果"
+                
+                pred_box_text = last_boxed_only_string(after_thinking_text)
+                connector_text = after_thinking_text.split(pred_box_text)[0] + "\\boxed{"
+                pred_text = remove_boxed(pred_box_text) + "}\n"
+
+            results.append({
+                "uid": uid,
+                "question_text": question_text,
+                "answer_text": wrong_response,
+                "thinking_text": thinking_text,
+                "connector_text": connector_text,
+                "pred_text": pred_text,
+                "gt_text": gt_text,
+                "problem": sample["problem"],
+                "answer_length": answer_length,
+            })
+        except Exception:
+            pass
+            
+    return results
+
+# =========================================================================
+# 3. Dataset 类及构建函数 (整合多进程)
+# =========================================================================
 class MathWrongDataset(Dataset):
-    def __init__(self, raw_samples, tok, thinking_ratio, max_samples, old_thinking_pattern=False):
+    def __init__(self, raw_samples, tok, thinking_ratio, max_samples, old_thinking_pattern=False, num_workers=16):
         self.flat_data = []
-        for sample_idx, sample in tqdm(enumerate(raw_samples), leave=True, total=len(raw_samples), desc="Building MathWrongDataset..."):
-            messages = [{"role": "user", "content": sample["problem"]}]
-            question_text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True) + "<think>"
-            gt_text = sample["gold_answer"] + "}\n"
+        
+        # 准备分发给各个子进程的参数
+        worker_args = [
+            (idx, sample, thinking_ratio, old_thinking_pattern) 
+            for idx, sample in enumerate(raw_samples)
+        ]
+        
+        # 使用多进程加速 Tokenizer 操作
+        chunksize = max(1, len(worker_args) // (num_workers * 4))
+        with Pool(processes=num_workers, initializer=_init_tokenize_worker, initargs=(tok,)) as pool:
+            for batch_results in tqdm(
+                pool.imap_unordered(_tokenize_and_format_sample, worker_args, chunksize=chunksize), 
+                total=len(worker_args), 
+                desc=f"Tokenizing Dataset ({num_workers} Workers)"
+            ):
+                if batch_results:
+                    self.flat_data.extend(batch_results)
+                    # 达到数量上限可提前退出迭代（注：imap_unordered 可能会在后台多处理几个，我们稍后做精确截断）
+                    if len(self.flat_data) >= max_samples:
+                        break
 
-            for response_idx, wrong_response in enumerate(sample["complete_wrong_responses"]):
-                uid = f"sample{sample_idx}_resp{response_idx}"
-                try:
-                    if old_thinking_pattern:
-                        parts = wrong_response.split("</think>")
-                        if len(parts) == 2:
-                            thinking_text = parts[0]
-                            # 既然 len(parts) == 2，直接取 parts[1] 即可
-                            after_thinking_text = parts[1] 
-                            assert "\\boxed{" in after_thinking_text, f"[{uid}] 缺少 boxed 结果"
-                            pred_box_text = last_boxed_only_string(after_thinking_text)
-                            connector_text = after_thinking_text.split(pred_box_text)[0] + "\\boxed{"
-                            pred_text = remove_boxed(pred_box_text) + "}\n"
-                    else:
-                        tokens = tok.encode(wrong_response, add_special_tokens=False)
-                        answer_length = len(tokens)
-                        split_idx = int(len(tokens) * thinking_ratio)
-                        thinking_text = tok.decode(tokens[:split_idx])
-                        # 将剩余的 20% 作为 after_thinking_text，防止后续处理报错
-                        after_thinking_text = tok.decode(tokens[split_idx:])
-                        # 同样需要确保后 20% 包含结果，如果不包含会触发 except 直接跳过该样本
-                        assert "\\boxed{" in after_thinking_text, f"[{uid}] 截断后的后20%文本中缺少 boxed 结果"
-                        pred_box_text = last_boxed_only_string(after_thinking_text)
-                        connector_text = after_thinking_text.split(pred_box_text)[0] + "\\boxed{"
-                        pred_text = remove_boxed(pred_box_text) + "}\n"
-
-                    self.flat_data.append(
-                        {
-                            "uid": uid,
-                            "question_text": question_text,
-                            "answer_text": wrong_response,
-                            "thinking_text": thinking_text,
-                            "connector_text": connector_text,
-                            "pred_text": pred_text,
-                            "gt_text": gt_text,
-                            "problem": sample["problem"],
-                            "answer_length": answer_length,
-                        }
-                    )
-                except Exception:
-                    pass
-            if len(self.flat_data) > max_samples:
-                break
+        # 精确截断到 max_samples
         self.flat_data = self.flat_data[:max_samples]
-        # self.flat_data = sorted(self.flat_data, key=lambda x: -len(x["thinking_text"]))
-        print(f"data_size:{len(self.flat_data)} avg len: {np.mean([d['answer_length'] for d in self.flat_data])}")
+        
+        if len(self.flat_data) > 0:
+            avg_len = np.mean([d['answer_length'] for d in self.flat_data])
+            print(f"✅ 构建完成! data_size: {len(self.flat_data)} | avg len: {avg_len:.1f}")
+        else:
+            print("⚠️ 警告: 构建完成，但未提取到任何有效数据！")
 
     def __len__(self):
         return len(self.flat_data)
@@ -69,28 +146,27 @@ class MathWrongDataset(Dataset):
         return self.flat_data[idx]
 
 
-def build_math_wrong_dataset(file_path: str, tok: AutoTokenizer, thinking_ratio, max_samples) -> MathWrongDataset:
+def build_math_wrong_dataset(file_path: str, tok: AutoTokenizer, thinking_ratio, max_samples, num_workers: int = 16) -> MathWrongDataset:
     results = [json.loads(line) for line in open(file_path, "r", encoding="utf-8")]
     new_wrong_data = []
-    for item in tqdm(results, desc="Processing Data", leave=False):
-        gold_answer = item.get("answer", item.get("ground_truth", None))
-        responses = item.get("responses", [])
-        if not any(is_correct_v3(p, gold_answer) for p in responses):
-            complete_but_wrong_responses = [
-                res
-                for res in responses
-                if last_boxed_only_string(res)
-                and not math_verify_verify(
-                    math_verify_parse(remove_boxed(last_boxed_only_string(res))),
-                    math_verify_parse(gold_answer.strip()),
-                )
-            ]
-            if complete_but_wrong_responses:
-                new_wrong_data.append(
-                    {
-                        "problem": item.get("q", item.get("problem", item.get("question", None))),
-                        "gold_answer": gold_answer,
-                        "complete_wrong_responses": complete_but_wrong_responses,
-                    }
-                )
-    return MathWrongDataset(new_wrong_data, tok, thinking_ratio, max_samples)
+    
+    # 阶段 1：多进程过滤出完整但错误的回答
+    chunksize = max(1, len(results) // (num_workers * 4))
+    with Pool(processes=num_workers) as pool:
+        for processed_item in tqdm(
+            pool.imap_unordered(_process_single_item, results, chunksize=chunksize), 
+            total=len(results), 
+            desc=f"Filtering Responses ({num_workers} Workers)"
+        ):
+            if processed_item is not None:
+                new_wrong_data.append(processed_item)
+
+    # 阶段 2：多进程进行 Tokenizer 截断与转换（Dataset 内部实现）
+    return MathWrongDataset(
+        raw_samples=new_wrong_data, 
+        tok=tok, 
+        thinking_ratio=thinking_ratio, 
+        max_samples=max_samples, 
+        old_thinking_pattern=False, 
+        num_workers=num_workers
+    )
