@@ -41,8 +41,8 @@ MODELS=(
     # "Qwen/Qwen3-0.6B"
     # "Qwen/Qwen3-1.7B"
     # "Qwen/Qwen2.5-1.5B-Instruct"
-    "Qwen/Qwen3-4B"
-    "Qwen/Qwen3-8B"
+    # "Qwen/Qwen3-4B"
+    # "Qwen/Qwen3-8B"
     # "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
     # "/workspace/yiqiuguo/lsrl/checkpoints/radiant-bee-213/step474"
     # "/workspace/yiqiuguo/lsrl/checkpoints/gallant-firebrand-212/step688"
@@ -62,23 +62,24 @@ MODELS=(
     # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_opsddebug/step35"
     # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_opsddebug/step108"
     # "/workspace/yiqiuguo/lsrl/checkpoints/latopt-distill-exp-dapo-qwen2-lm_loss_contrastive_opsddebug/step200"
+    /workspace/yiqiuguo/lsrl/checkpoints/dummy-c9gprqh8/step3000
 )
 
 # 2. 定义要评测的数据集列表
 DATASETS=(
-    "mnoukhov/dapo_math_14k_en_openinstruct"
-    # "HuggingFaceH4/MATH-500"
+    # "mnoukhov/dapo_math_14k_en_openinstruct"
+    "HuggingFaceH4/MATH-500"
     # "KbsdJames/Omni-MATH"
-    # "math-ai/aime25"
-    # "HuggingFaceH4/aime_2024"
-    # "math-ai/amc23"
+    "math-ai/aime25"
+    "HuggingFaceH4/aime_2024"
+    "math-ai/amc23"
 )
 
 # 3. 固定的采样和硬件参数
 NUM_GPUS=4
 N=32
 TEMP=1.0
-MAX_TOKENS=8192
+MAX_TOKENS=32768
 TOP_P=0.95
 
 cd /workspace/yiqiuguo/lsrl

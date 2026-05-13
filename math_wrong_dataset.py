@@ -49,53 +49,33 @@ def _init_tokenize_worker(tok):
     _worker_tok = tok
 
 def _tokenize_and_format_sample(args):
-    """处理单个样本的 Tokenize 和截断逻辑"""
+    """处理单个样本的 Tokenize 和格式化逻辑"""
     sample_idx, sample, thinking_ratio, old_thinking_pattern = args
     tok = _worker_tok
     results = []
     
-    messages = [{"role": "user", "content": sample["problem"]}]
-    question_text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True) + "<think>"
-    gt_text = sample["gold_answer"] + "}\n"
+    # prompt content 仅包含问题本身
+    prompt_list = [{"role": "user", "content": sample["problem"]}]
+    # 按照 DAPO 格式，这是一个 object array
+    prompt_arr = np.array(prompt_list, dtype=object)
 
     for response_idx, wrong_response in enumerate(sample["complete_wrong_responses"]):
         uid = f"sample{sample_idx}_resp{response_idx}"
         try:
-            answer_length = 0
-            if old_thinking_pattern:
-                parts = wrong_response.split("</think>")
-                if len(parts) == 2:
-                    thinking_text = parts[0]
-                    after_thinking_text = parts[1] 
-                    assert "\\boxed{" in after_thinking_text, f"[{uid}] 缺少 boxed 结果"
-                    
-                    pred_box_text = last_boxed_only_string(after_thinking_text)
-                    connector_text = after_thinking_text.split(pred_box_text)[0] + "\\boxed{"
-                    pred_text = remove_boxed(pred_box_text) + "}\n"
-                    # 为了统计，补算一下长度
-                    answer_length = len(tok.encode(wrong_response, add_special_tokens=False))
-            else:
-                tokens = tok.encode(wrong_response, add_special_tokens=False)
-                answer_length = len(tokens)
-                split_idx = int(len(tokens) * thinking_ratio)
-                thinking_text = tok.decode(tokens[:split_idx])
-                after_thinking_text = tok.decode(tokens[split_idx:])
-                
-                assert "\\boxed{" in after_thinking_text, f"[{uid}] 截断后缺少 boxed 结果"
-                
-                pred_box_text = last_boxed_only_string(after_thinking_text)
-                connector_text = after_thinking_text.split(pred_box_text)[0] + "\\boxed{"
-                pred_text = remove_boxed(pred_box_text) + "}\n"
+            # 计算 answer_length 用于统计
+            tokens = tok.encode(wrong_response, add_special_tokens=False)
+            answer_length = len(tokens)
 
             results.append({
                 "uid": uid,
-                "question_text": question_text,
+                "data_source": "math_wrong",
+                "prompt": prompt_arr,
+                "ability": "MATH",
+                "reward_model": {
+                    "ground_truth": sample["gold_answer"].strip(),
+                },
                 "answer_text": wrong_response,
-                "thinking_text": thinking_text,
-                "connector_text": connector_text,
-                "pred_text": pred_text,
-                "gt_text": gt_text,
-                "problem": sample["problem"],
+                "question": sample["problem"],
                 "answer_length": answer_length,
             })
         except Exception:
@@ -170,3 +150,42 @@ def build_math_wrong_dataset(file_path: str, tok: AutoTokenizer, thinking_ratio,
         old_thinking_pattern=False, 
         num_workers=num_workers
     )
+
+
+if __name__ == "__main__":
+    import argparse
+    import pandas as pd
+    
+    parser = argparse.ArgumentParser(description="Build math wrong dataset from jsonl and save as parquet.")
+    parser.add_argument("file_path", type=str, help="Path to the input jsonl file.")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-1.7B", help="Model name or path for tokenizer.")
+    parser.add_argument("--thinking_ratio", type=float, default=0.8, help="Ratio to split thinking and response.")
+    parser.add_argument("--max_samples", type=int, default=9999999, help="Maximum number of samples to process.")
+    parser.add_argument("--num_workers", type=int, default=16, help="Number of worker processes.")
+    
+    args = parser.parse_args()
+    
+    print(f"Loading tokenizer from {args.model_name}...")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
+    
+    print(f"Building dataset from {args.file_path}...")
+    dataset = build_math_wrong_dataset(
+        args.file_path, 
+        tokenizer, 
+        args.thinking_ratio, 
+        args.max_samples, 
+        args.num_workers
+    )
+    
+    if dataset.flat_data:
+        df = pd.DataFrame(dataset.flat_data)
+        
+        # Generate output path: original_filename_wrong.parquet
+        base, _ = os.path.splitext(args.file_path)
+        output_path = f"{base}_wrong.parquet"
+        
+        print(f"Saving {len(df)} samples to {output_path}...")
+        df.to_parquet(output_path)
+        print("Done!")
+    else:
+        print("No valid data found to save.")

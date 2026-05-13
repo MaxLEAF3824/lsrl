@@ -9,3 +9,6 @@ __pycache__/*
 *.jsonl
 debug_*.txt
 temp_*.txt
+outputs/*
+.gemini/*
+core
